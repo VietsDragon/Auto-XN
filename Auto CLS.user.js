@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto CLS M3 Batch Clean
 // @namespace    medinet-auto-cls-m3-batch-clean
-// @version      1.4.5
+// @version      1.5.0
 // @description  M3: tìm XN theo Họ tên + ngày XN, điền/lưu CLS, mở/lưu Kết luận, quay lại danh sách và tiếp tục batch.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
@@ -83,16 +83,13 @@
     const KEY_CASE = 'm3_cls_clean_case_v100';
     const KEY_STATS = 'm3_cls_clean_stats_v100';
     // Namespace mới để không mang theo các ca SKIP tích lũy từ những lần chạy
-    // v1.0-v1.3.4. SKIP vẫn được dùng chung giữa các tab trong đợt chạy mới.
+    // v1.0-v1.3.4. SKIP được giữ lại để tránh chạy lại ngoài ý muốn.
     const KEY_SKIPPED = 'm3_cls_clean_skipped_v135';
     const KEY_DONE = 'm3_cls_clean_done_v100';
     const KEY_ERRORS = 'm3_cls_clean_errors_v100';
     const KEY_RETRIES = 'm3_cls_clean_retries_v100';
     const KEY_LAST_URL = 'm3_cls_clean_last_url_v100';
     const KEY_RELOAD_COUNT = 'm3_cls_clean_reload_count_v100';
-    const KEY_CLAIMS = 'm3_cls_clean_claims_v130';
-    const CLAIM_LEASE_MS = 3 * 60 * 1000;
-    const WORKER_ID = `W-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     // Đổi sau mỗi lần trình duyệt tải lại toàn trang. Được lưu vào ca trước khi
     // bấm Lưu CLS để nhận biết chính xác lần reload đã hoàn tất.
     const PAGE_INSTANCE_ID = `P-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -139,6 +136,15 @@
         r.status = Number(status) || 0;
         r.error = error ? String(error) : '';
         r.finishedAt = Date.now();
+
+        // Batch có thể chạy hàng trăm ca; tránh Map request tăng vô hạn.
+        if (NET.records.size > 300) {
+            const cutoff = Date.now() - 2 * 60 * 1000;
+            for (const [key, rec] of NET.records) {
+                if (rec.done && Number(rec.finishedAt || 0) < cutoff) NET.records.delete(key);
+                if (NET.records.size <= 200) break;
+            }
+        }
     }
 
     function installNetworkTracker() {
@@ -300,11 +306,19 @@
 
     function getStats() {
         return getJson(KEY_STATS, {
+            processed: 0,
             done: 0,
+            skipped: 0,
             skippedNotFound: 0,
             skippedDuplicate: 0,
             skippedInvalid: 0,
-            errors: 0
+            errors: 0,
+            retries: 0,
+            startedAt: 0,
+            totalProcessMs: 0,
+            timedCases: 0,
+            lastError: '',
+            lastErrorAt: 0
         });
     }
 
@@ -319,9 +333,7 @@
         sessionStorage.removeItem(KEY_STATS);
         sessionStorage.removeItem(KEY_RETRIES);
         sessionStorage.removeItem(KEY_RELOAD_COUNT);
-        // DONE/SKIP/ERROR là danh sách dùng chung giữa các worker/tab.
-        // Không xóa khi một tab mới bấm Bắt đầu, nếu không tab sau sẽ làm mất
-        // dấu ca mà tab trước vừa xử lý.
+        // DONE/SKIP/ERROR được giữ lại giữa các lần chạy để tránh xử lý lại ca cũ.
     }
 
     function caseKey(c) {
@@ -330,86 +342,14 @@
         return `NAME:${norm(c.hoTen)}|DOB:${c.ngaySinh || ''}|SEX:${norm(c.gioiTinh)}|DATE:${c.ngayKham || ''}`;
     }
 
-    async function withSharedLock(name, fn) {
-        if (navigator.locks?.request) {
-            return await navigator.locks.request(name, fn);
-        }
-        return await fn();
-    }
-
-    function pruneClaims(claims) {
-        const now = Date.now();
-        for (const [key, claim] of Object.entries(claims || {})) {
-            if (!claim || Number(claim.expiresAt || 0) <= now) delete claims[key];
-        }
-        return claims || {};
-    }
-
-    function isClaimedByOther(c) {
-        const key = caseKey(c);
-        if (!key) return false;
-        const claims = pruneClaims(getLocalJson(KEY_CLAIMS, {}));
-        const claim = claims[key];
-        return !!claim && claim.owner !== WORKER_ID;
-    }
-
-    async function claimCase(c) {
-        const key = caseKey(c);
-        if (!key) return false;
-        return await withSharedLock('m3-cls-claim-gate-v130', async () => {
-            const claims = pruneClaims(getLocalJson(KEY_CLAIMS, {}));
-            const current = claims[key];
-            if (current && current.owner !== WORKER_ID) return false;
-            const token = current?.token || `${WORKER_ID}-${Math.random().toString(36).slice(2)}`;
-            claims[key] = {
-                owner: WORKER_ID,
-                token,
-                expiresAt: Date.now() + CLAIM_LEASE_MS,
-                hoTen: c.hoTen || '',
-                ngayKham: c.ngayKham || ''
-            };
-            setLocalJson(KEY_CLAIMS, claims);
-            c.claimToken = token;
-            return true;
-        });
-    }
-
-    async function renewCurrentClaim() {
-        const c = getCase();
-        if (!isActive() || !c) return;
-        const key = caseKey(c);
-        if (!key) return;
-        await withSharedLock('m3-cls-claim-gate-v130', async () => {
-            const claims = pruneClaims(getLocalJson(KEY_CLAIMS, {}));
-            const current = claims[key];
-            if (current?.owner === WORKER_ID) {
-                current.expiresAt = Date.now() + CLAIM_LEASE_MS;
-                claims[key] = current;
-                setLocalJson(KEY_CLAIMS, claims);
-            }
-        });
-    }
-
-    async function releaseClaim(c) {
-        const key = caseKey(c);
-        if (!key) return;
-        await withSharedLock('m3-cls-claim-gate-v130', async () => {
-            const claims = pruneClaims(getLocalJson(KEY_CLAIMS, {}));
-            if (claims[key]?.owner === WORKER_ID) {
-                delete claims[key];
-                setLocalJson(KEY_CLAIMS, claims);
-            }
-        });
-    }
+    // Bản 1.5 chỉ chạy một tab: bỏ toàn bộ claim/lease/worker để state đơn giản và ổn định hơn.
 
     async function addDone(c) {
         const key = caseKey(c);
         if (!key) return;
-        await withSharedLock('m3-cls-result-write-v130', async () => {
-            const done = getLocalJson(KEY_DONE, {});
-            done[key] = { time: Date.now(), c };
-            setLocalJson(KEY_DONE, done);
-        });
+        const done = getLocalJson(KEY_DONE, {});
+        done[key] = { time: Date.now(), c };
+        setLocalJson(KEY_DONE, done);
     }
 
     function isDone(c) {
@@ -418,16 +358,18 @@
 
     async function addSkipped(c, reason, type) {
         const key = caseKey(c);
-        await withSharedLock('m3-cls-result-write-v130', async () => {
-            const skipped = getLocalJson(KEY_SKIPPED, {});
-            skipped[key] = { time: Date.now(), c, reason, type };
-            setLocalJson(KEY_SKIPPED, skipped);
-        });
+        const stage = getStage();
+        const retryCount = getRetryCount(c || {}, stage);
+        const skipped = getLocalJson(KEY_SKIPPED, {});
+        skipped[key] = { time: Date.now(), c, reason, type, stage, retryCount };
+        setLocalJson(KEY_SKIPPED, skipped);
 
         const s = getStats();
         if (type === 'NOT_FOUND') s.skippedNotFound++;
         else if (type === 'DUPLICATE') s.skippedDuplicate++;
         else s.skippedInvalid++;
+        s.skipped = (s.skipped || 0) + 1;
+        s.processed = (s.processed || 0) + 1;
         if (c?.startedAt) {
             s.totalProcessMs = (s.totalProcessMs || 0) + Math.max(0, Date.now() - c.startedAt);
             s.timedCases = (s.timedCases || 0) + 1;
@@ -440,13 +382,15 @@
     }
 
     async function addError(c, reason) {
-        await withSharedLock('m3-cls-result-write-v130', async () => {
-            const errors = getLocalJson(KEY_ERRORS, []);
-            errors.push({ time: new Date().toISOString(), c, reason });
-            setLocalJson(KEY_ERRORS, errors);
-        });
+        const stage = getStage();
+        const retryCount = getRetryCount(c || {}, stage);
+        const errors = getLocalJson(KEY_ERRORS, []);
+        errors.push({ time: new Date().toISOString(), c, reason, stage, retryCount });
+        setLocalJson(KEY_ERRORS, errors);
         const s = getStats();
         s.errors++;
+        s.lastError = reason;
+        s.lastErrorAt = Date.now();
         saveStats(s);
     }
 
@@ -499,12 +443,17 @@
             <div class="h"><span>🤖 AUTO SỬA CLS M3</span><span id="m3cls-active-label">DỪNG</span></div>
             <div class="b">
                 <div class="row"><span>Trạng thái</span><b id="m3cls-stage">-</b></div>
-                <div class="row"><span>Worker</span><b id="m3cls-worker">-</b></div>
-                <div class="row"><span>Đã hoàn tất</span><span id="m3cls-done" class="m3cls-ok">0</span></div>
-                <div class="row"><span>Không tìm thấy XN</span><span id="m3cls-notfound" class="m3cls-warn">0</span></div>
-                <div class="row"><span>Trùng kết quả</span><span id="m3cls-dup" class="m3cls-warn">0</span></div>
-                <div class="row"><span>Lỗi</span><span id="m3cls-errors" class="m3cls-bad">0</span></div>
-                <div class="row"><span>Tốc độ trung bình</span><span id="m3cls-speed">—</span></div>
+                <div class="row"><span>Đã xử lý</span><b id="m3cls-processed">0</b></div>
+                <div class="row"><span>Hoàn tất</span><span id="m3cls-done" class="m3cls-ok">0</span></div>
+                <div class="row"><span>Bỏ qua</span><span id="m3cls-skipped" class="m3cls-warn">0</span></div>
+                <div class="row"><span>↳ Không tìm thấy XN</span><span id="m3cls-notfound">0</span></div>
+                <div class="row"><span>↳ Trùng kết quả</span><span id="m3cls-dup">0</span></div>
+                <div class="row"><span>↳ Không hợp lệ</span><span id="m3cls-invalid">0</span></div>
+                <div class="row"><span>Lỗi ghi nhận</span><span id="m3cls-errors" class="m3cls-bad">0</span></div>
+                <div class="row"><span>Retry</span><span id="m3cls-retries">0</span></div>
+                <div class="row"><span>Tỷ lệ hoàn tất</span><b id="m3cls-success">—</b></div>
+                <div class="row"><span>Tốc độ TB</span><span id="m3cls-speed">—</span></div>
+                <div class="row"><span>Đã chạy</span><span id="m3cls-elapsed">—</span></div>
                 <div style="margin-top:7px;padding-top:7px;border-top:1px solid #e2e8f0"><b id="m3cls-patient">Chưa chạy</b><div id="m3cls-detail" style="color:#64748b;margin-top:2px"></div></div>
             </div>
             <div class="actions"><button id="m3cls-start">▶ BẮT ĐẦU</button><button id="m3cls-stop">⏹ DỪNG</button><button id="m3cls-report">📋</button><button id="m3cls-reset-skip" title="Xóa danh sách SKIP để chạy lại">↻ SKIP</button></div>
@@ -523,20 +472,40 @@
         if (!p) return;
         const s = getStats();
         const c = getCase();
+        const processed = Number(s.processed || 0);
+        const done = Number(s.done || 0);
+        const skipped = Number(s.skipped || (s.skippedNotFound || 0) + (s.skippedDuplicate || 0) + (s.skippedInvalid || 0));
+        const timedCases = Number(s.timedCases || 0);
+        const timedMinutes = Number(s.totalProcessMs || 0) / 60000;
+        const elapsedMs = s.startedAt ? Math.max(0, Date.now() - s.startedAt) : 0;
+        const fmtElapsed = ms => {
+            if (!ms) return '—';
+            const sec = Math.floor(ms / 1000);
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const ss = sec % 60;
+            return h ? `${h}g ${m}p` : (m ? `${m}p ${ss}s` : `${ss}s`);
+        };
+
         document.getElementById('m3cls-active-label').textContent = isActive() ? 'ĐANG CHẠY' : 'DỪNG';
         document.getElementById('m3cls-stage').textContent = getStage();
-        document.getElementById('m3cls-worker').textContent = `${WORKER_ID.slice(-5)} · ${document.hidden ? 'TAB ẨN' : 'HIỂN THỊ'}`;
-        document.getElementById('m3cls-done').textContent = s.done;
-        document.getElementById('m3cls-notfound').textContent = s.skippedNotFound;
-        document.getElementById('m3cls-dup').textContent = s.skippedDuplicate;
-        document.getElementById('m3cls-errors').textContent = s.errors;
-        const timedCases = s.timedCases || 0;
-        const timedMinutes = (s.totalProcessMs || 0) / 60000;
+        document.getElementById('m3cls-processed').textContent = processed;
+        document.getElementById('m3cls-done').textContent = done;
+        document.getElementById('m3cls-skipped').textContent = skipped;
+        document.getElementById('m3cls-notfound').textContent = s.skippedNotFound || 0;
+        document.getElementById('m3cls-dup').textContent = s.skippedDuplicate || 0;
+        document.getElementById('m3cls-invalid').textContent = s.skippedInvalid || 0;
+        document.getElementById('m3cls-errors').textContent = s.errors || 0;
+        document.getElementById('m3cls-retries').textContent = s.retries || 0;
+        document.getElementById('m3cls-success').textContent = processed ? `${((done / processed) * 100).toFixed(1)}%` : '—';
         document.getElementById('m3cls-speed').textContent = timedCases && timedMinutes > 0
             ? `${(timedMinutes / timedCases).toFixed(1)} phút/ca`
             : '—';
+        document.getElementById('m3cls-elapsed').textContent = fmtElapsed(elapsedMs);
         document.getElementById('m3cls-patient').textContent = c ? (c.hoTen || '(không tên)') : 'Chưa có ca';
-        document.getElementById('m3cls-detail').textContent = c ? `${c.cccd || '—'} · ${c.ngaySinh || '—'} · ${c.gioiTinh || '—'} · khám ${c.ngayKham || '—'}` : '';
+        document.getElementById('m3cls-detail').textContent = c
+            ? `${c.cccd || '—'} · khám ${c.ngayKham || '—'} · ${getStage()}`
+            : (s.lastError ? `Lỗi gần nhất: ${s.lastError}` : '');
     }
 
     function showStatus(message) {
@@ -563,15 +532,39 @@
             .slice()
             .sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
         const s = getStats();
-        let txt = `AUTO SỬA CLS M3\n\nDONE phiên này: ${s.done}\nTỔNG SKIP đang lưu: ${skipped.length}\nTỔNG ERROR đang lưu: ${errors.length}\nKhông tìm thấy XN phiên này: ${s.skippedNotFound}\nTrùng phiên này: ${s.skippedDuplicate}\nKhông hợp lệ phiên này: ${s.skippedInvalid}\nLỗi phiên này: ${s.errors}`;
+        const processed = Number(s.processed || 0);
+        const done = Number(s.done || 0);
+        const skippedCount = Number(s.skipped || 0);
+        const success = processed ? ((done / processed) * 100).toFixed(1) + '%' : '—';
+        const avg = s.timedCases ? ((s.totalProcessMs || 0) / 60000 / s.timedCases).toFixed(1) + ' phút/ca' : '—';
+        const started = s.startedAt ? new Date(s.startedAt).toLocaleString('vi-VN') : '—';
+
+        let txt = `AUTO SỬA CLS M3 v1.5.0 - SINGLE TAB
+Bắt đầu: ${started}
+
+=== THỐNG KÊ PHIÊN NÀY ===
+Đã xử lý: ${processed}
+Hoàn tất: ${done} (${success})
+Bỏ qua: ${skippedCount}
+  - Không tìm thấy XN: ${s.skippedNotFound || 0}
+  - Trùng kết quả: ${s.skippedDuplicate || 0}
+  - Không hợp lệ/lỗi: ${s.skippedInvalid || 0}
+Lỗi ghi nhận: ${s.errors || 0}
+Retry: ${s.retries || 0}
+Tốc độ trung bình: ${avg}
+
+=== DỮ LIỆU ĐANG LƯU ===
+Tổng SKIP: ${skipped.length}
+Tổng ERROR: ${errors.length}`;
+
         if (skipped.length) {
-            txt += '\n\n--- TOÀN BỘ SKIP ---\n' + skipped.map((x, i) =>
-                `${i + 1}. Trang ${x.c?.pageNumber || '?'} · STT ${x.c?.rowStt || '?'} | ${x.c?.hoTen || '?'} | ${x.c?.cccd || '?'} | khám ${x.c?.ngayKham || '?'} | ${x.type || 'SKIP'} | ${x.reason || ''}`
+            txt += `\n\n=== SKIP ===\n` + skipped.map((x, i) =>
+                `${i + 1}. Trang ${x.c?.pageNumber || '?'} · STT ${x.c?.rowStt || '?'} | ${x.c?.hoTen || '?'} | ${x.c?.cccd || '?'} | khám ${x.c?.ngayKham || '?'} | ${x.type || 'SKIP'} | stage=${x.stage || '?'} | retry=${x.retryCount || 0} | ${x.reason || ''}`
             ).join('\n');
         }
         if (errors.length) {
-            txt += '\n\n--- TOÀN BỘ ERROR ---\n' + errors.map((x, i) =>
-                `${i + 1}. Trang ${x.c?.pageNumber || '?'} · STT ${x.c?.rowStt || '?'} | ${x.c?.hoTen || '?'} | ${x.c?.cccd || '?'} | khám ${x.c?.ngayKham || '?'} | ${x.reason || ''}`
+            txt += `\n\n=== ERROR ===\n` + errors.map((x, i) =>
+                `${i + 1}. ${new Date(x.time).toLocaleString('vi-VN')} | Trang ${x.c?.pageNumber || '?'} · STT ${x.c?.rowStt || '?'} | ${x.c?.hoTen || '?'} | ${x.c?.cccd || '?'} | stage=${x.stage || '?'} | retry=${x.retryCount || 0} | ${x.reason || ''}`
             ).join('\n');
         }
         return txt;
@@ -605,13 +598,11 @@
 
     async function resetErrorList(reportOverlay) {
         if (isActive()) {
-            alert('Hãy bấm DỪNG trước khi xóa ERROR. Nếu đang chạy nhiều tab, hãy dừng tất cả tab trước.');
+            alert('Hãy bấm DỪNG trước khi xóa ERROR.');
             return;
         }
-        if (!confirm('XÓA TOÀN BỘ DANH SÁCH ERROR DÙNG CHUNG?\n\nDanh sách SKIP và DONE không bị xóa.')) return;
-        await withSharedLock('m3-cls-result-write-v130', async () => {
-            localStorage.removeItem(KEY_ERRORS);
-        });
+        if (!confirm('XÓA TOÀN BỘ DANH SÁCH ERROR?\n\nDanh sách SKIP và DONE không bị xóa.')) return;
+        localStorage.removeItem(KEY_ERRORS);
         const s = getStats();
         s.errors = 0;
         saveStats(s);
@@ -621,13 +612,11 @@
 
     async function resetSkippedList() {
         if (isActive()) {
-            alert('Hãy bấm DỪNG trước khi xóa danh sách SKIP. Nếu đang chạy nhiều tab, hãy dừng tất cả tab trước.');
+            alert('Hãy bấm DỪNG trước khi xóa danh sách SKIP.');
             return;
         }
-        if (!confirm('XÓA TOÀN BỘ DANH SÁCH SKIP DÙNG CHUNG?\n\nCác ca này sẽ được tìm XN lại ở lần chạy kế tiếp. Danh sách DONE không bị xóa.')) return;
-        await withSharedLock('m3-cls-result-write-v130', async () => {
-            localStorage.removeItem(KEY_SKIPPED);
-        });
+        if (!confirm('XÓA TOÀN BỘ DANH SÁCH SKIP?\n\nCác ca này sẽ được tìm XN lại ở lần chạy kế tiếp. Danh sách DONE không bị xóa.')) return;
+        localStorage.removeItem(KEY_SKIPPED);
         const s = getStats();
         s.skippedNotFound = 0;
         s.skippedDuplicate = 0;
@@ -647,12 +636,12 @@
         }
         if (!confirm('BẮT ĐẦU AUTO SỬA CLS M3?\n\nScript sẽ TỰ LƯU dữ liệu trên Medinet:\n1) điền + lưu Cận lâm sàng\n2) mở + lưu Kết luận\n3) quay lại danh sách, chờ bảng tải xong rồi tiếp tục\n\nNên theo dõi kỹ vài ca đầu.')) return;
 
-        await releaseClaim(getCase());
         resetRunState();
         saveStats({
-            done: 0, skippedNotFound: 0, skippedDuplicate: 0,
-            skippedInvalid: 0, errors: 0, startedAt: Date.now(),
-            totalProcessMs: 0, timedCases: 0
+            processed: 0, done: 0, skipped: 0,
+            skippedNotFound: 0, skippedDuplicate: 0, skippedInvalid: 0,
+            errors: 0, retries: 0, startedAt: Date.now(),
+            totalProcessMs: 0, timedCases: 0, lastError: '', lastErrorAt: 0
         });
         setActive(true);
         setStage(STAGE.LIST);
@@ -660,7 +649,6 @@
     }
 
     async function stopBatch() {
-        await releaseClaim(getCase());
         setActive(false);
         hideStatus();
         updatePanel();
@@ -1775,7 +1763,17 @@
         if (!fastClick(btn)) throw new Error(`${label}: không kích hoạt được nút Lưu.`);
         const network = await waitForTriggeredNetwork(marker, clickedAt, label);
         log(`${label}:`, network.captured ? `đã chờ ${network.count} request` : 'không bắt được request, dùng fallback ngắn');
-        return { confirmed: true, attempt: 1 };
+
+        // Không được gắn confirmed=true giả. Khi tracker không bắt được request
+        // hoặc chỉ thấy status 0, vẫn cho state machine tiếp tục và dùng kiểm tra
+        // render/trang ở bước sau; nhưng giữ đúng mức độ tin cậy để log/debug.
+        return {
+            confirmed: network.confirmed === true,
+            uncertain: network.uncertain === true || !network.captured,
+            captured: network.captured === true,
+            requestCount: Number(network.count || 0),
+            attempt: 1
+        };
     }
 
     // Sau khi Lưu CLS, Medinet có thể reload toàn trang hoặc chỉ render lại
@@ -1846,7 +1844,6 @@
         await addSkipped(c, reason, type);
         setStage(STAGE.RETURN_LIST);
         if (!isListPage()) await goBackToList();
-        await releaseClaim(c);
         setCase(null);
         setStage(STAGE.LIST);
         await sleep(300);
@@ -1862,6 +1859,9 @@
         if (stage === STAGE.SAVE_CLS || stage === STAGE.SAVE_CONCLUSION) {
             const n = incRetry(c || {}, stage);
             if (n <= 2) {
+                const s = getStats();
+                s.retries = (s.retries || 0) + 1;
+                saveStats(s);
                 showStatus(`Lỗi lưu tạm thời · thử lại ${n}/2: ${reason}`);
                 await sleep(700);
                 queueRun();
@@ -1871,8 +1871,7 @@
             if (c) await addSkipped(c, `Lỗi lưu sau 2 lần thử: ${stage} - ${reason}`, 'INVALID');
             setStage(STAGE.RETURN_LIST);
             if (!isListPage()) await goBackToList();
-            await releaseClaim(c);
-            setCase(null);
+                setCase(null);
             setStage(STAGE.LIST);
             queueRun(500);
             return;
@@ -1881,6 +1880,9 @@
         const n = incRetry(c || {}, stage);
         warn(`ERROR stage=${stage} retry=${n}`, reason);
         if (n <= 2) {
+            const s = getStats();
+            s.retries = (s.retries || 0) + 1;
+            saveStats(s);
             showStatus(`Lỗi tạm thời (${stage}) - thử lại ${n}/2: ${reason}`);
             await sleep(1200);
             queueRun();
@@ -1890,7 +1892,6 @@
         if (c) await addSkipped(c, `Lỗi sau 2 lần thử: ${stage} - ${reason}`, 'INVALID');
         setStage(STAGE.RETURN_LIST);
         if (!isListPage()) await goBackToList();
-        await releaseClaim(c);
         setCase(null);
         setStage(STAGE.LIST);
         queueRun();
@@ -1937,28 +1938,20 @@
         const parsedCases = pencilLinks
             .map(link => ({ link, c: parseCaseFromPencil(link) }))
             .filter(x => x.c);
-        let found = null;
-        let blockedByOtherWorker = false;
-        for (const candidate of parsedCases) {
-            if (isDone(candidate.c) || isSkipped(candidate.c)) continue;
-            if (isClaimedByOther(candidate.c)) {
-                blockedByOtherWorker = true;
-                continue;
-            }
-            if (await claimCase(candidate.c)) {
-                found = candidate;
-                break;
-            }
-            blockedByOtherWorker = true;
-        }
+        const found = parsedCases.find(candidate => !isDone(candidate.c) && !isSkipped(candidate.c)) || null;
         if (found) {
             found.c.startedAt = Date.now();
             setCase(found.c);
             setStage(STAGE.OPENING_CASE);
             showStatus(`Mở ca: ${found.c.hoTen} · ${found.c.cccd}`);
-            robustClick(found.link);
+            if (!robustClick(found.link)) {
+                throw new Error(`Không kích hoạt được nút Xử lý của ${found.c.hoTen}.`);
+            }
             await sleep(500);
-            await waitFor(() => !isListPage(), 15000, 250);
+            const leftList = await waitFor(() => !isListPage(), 15000, 250);
+            if (!leftList) {
+                throw new Error(`Đã bấm Xử lý nhưng trang không mở hồ sơ của ${found.c.hoTen}.`);
+            }
             setStage(STAGE.OPEN_CLS);
             queueRun();
             return;
@@ -1980,11 +1973,7 @@
             return;
         }
 
-        // Đến trang cuối, không còn ca ngoài skip/done.
-        if (blockedByOtherWorker) {
-            finishBatch('Các ca còn lại đã được worker/tab khác nhận xử lý. Worker này đã nghỉ.');
-            return;
-        }
+        // Đến trang cuối, không còn ca ngoài SKIP/DONE.
         finishBatch('Đã quét hết các trang; chỉ còn ca đã SKIP hoặc không còn ca thiếu CLS.');
     }
 
@@ -2056,6 +2045,7 @@
         try {
             const save = await saveCurrentPage('LƯU Cận lâm sàng');
             c.clsSaveConfirmed = save.confirmed;
+            c.clsSaveUncertain = save.uncertain;
             c.clsSaveRequestFinishedAt = Date.now();
             setCase(c);
         } catch (error) {
@@ -2120,9 +2110,27 @@
             return;
         }
         const c = getCase();
-        const save = await saveCurrentPage('LƯU Kết luận');
-        if (c) { c.conclusionSaveConfirmed = save.confirmed; setCase(c); }
+        if (!c) throw new Error('Mất thông tin ca trước khi lưu Kết luận.');
+
+        // Ghi stage TRƯỚC cú bấm giống Lưu CLS. Nếu Medinet full reload ngay
+        // sau khi lưu, userscript sẽ tiếp tục ở RETURN_LIST thay vì bấm Lưu lại.
+        c.conclusionSavePageInstance = PAGE_INSTANCE_ID;
+        c.conclusionSaveStartedAt = Date.now();
+        setCase(c);
         setStage(STAGE.RETURN_LIST);
+
+        try {
+            const save = await saveCurrentPage('LƯU Kết luận');
+            c.conclusionSaveConfirmed = save.confirmed;
+            c.conclusionSaveUncertain = save.uncertain;
+            c.conclusionSaveRequestFinishedAt = Date.now();
+            setCase(c);
+        } catch (error) {
+            // Chỉ quay lại SAVE_CONCLUSION khi cú lưu lỗi rõ ràng và trang chưa
+            // reload mất context; failCurrent sẽ áp dụng retry giới hạn.
+            setStage(STAGE.SAVE_CONCLUSION);
+            throw error;
+        }
         queueRun();
     }
 
@@ -2148,13 +2156,13 @@
         await addDone(c);
         const s = getStats();
         s.done++;
+        s.processed = (s.processed || 0) + 1;
         if (c.startedAt) {
             s.totalProcessMs = (s.totalProcessMs || 0) + Math.max(0, Date.now() - c.startedAt);
             s.timedCases = (s.timedCases || 0) + 1;
         }
         saveStats(s);
         log('DONE SAVED:', c.hoTen, c.cccd, c.sid || '');
-        await releaseClaim(c);
         setCase(null);
         setStage(STAGE.LIST);
         await sleep(350);
@@ -2176,7 +2184,22 @@
         hideStatus();
         updatePanel();
         const s = getStats();
-        alert(`✅ AUTO SỬA CLS M3 KẾT THÚC\n\n${message}\n\nĐã hoàn tất: ${s.done}\nKhông tìm thấy XN: ${s.skippedNotFound}\nTrùng kết quả: ${s.skippedDuplicate}\nKhông hợp lệ/lỗi bỏ qua: ${s.skippedInvalid}\nLỗi ghi nhận: ${s.errors}\n\nBấm nút 📋 để xem danh sách SKIP/ERROR.`);
+        const processed = Number(s.processed || 0);
+        const success = processed ? ((Number(s.done || 0) / processed) * 100).toFixed(1) : '0.0';
+        alert(`✅ AUTO SỬA CLS M3 KẾT THÚC
+
+${message}
+
+Đã xử lý: ${processed}
+Hoàn tất: ${s.done || 0} (${success}%)
+Bỏ qua: ${s.skipped || 0}
+- Không tìm thấy XN: ${s.skippedNotFound || 0}
+- Trùng kết quả: ${s.skippedDuplicate || 0}
+- Không hợp lệ/lỗi: ${s.skippedInvalid || 0}
+Retry: ${s.retries || 0}
+Lỗi ghi nhận: ${s.errors || 0}
+
+Bấm 📋 để xem chi tiết.`);
     }
 
     let busy = false;
@@ -2261,9 +2284,7 @@
         installNetworkTracker();
         ensurePanel();
         installNavigationWatcher();
-        setInterval(() => {
-            renewCurrentClaim().catch(e => warn('Không gia hạn được khóa ca:', e));
-        }, 15000);
+        setInterval(() => { if (isActive()) updatePanel(); }, 1000);
         document.addEventListener('visibilitychange', () => {
             updatePanel();
             // Chromium có thể trì hoãn timer ở tab ẩn; chạy bù ngay khi tab
@@ -2275,7 +2296,7 @@
             await sleep(700);
             queueRun();
         }
-        log(`READY v1.3.3 WAIT-WRITES-THEN-SAVE ${WORKER_ID}`);
+        log('READY v1.5.0 SINGLE-TAB STATS+ERRORS');
     }
 
     init();
