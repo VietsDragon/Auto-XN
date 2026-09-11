@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto CLS M3 Batch Clean
 // @namespace    medinet-auto-cls-m3-batch-clean
-// @version      1.5.0
+// @version      1.5.1
 // @description  M3: tìm XN theo Họ tên + ngày XN, điền/lưu CLS, mở/lưu Kết luận, quay lại danh sách và tiếp tục batch.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
@@ -1301,6 +1301,35 @@ Tổng ERROR: ${errors.length}`;
         return null;
     }
 
+
+    // Portal mới đổi Glucose máu thành "Đường máu bất kỳ (mmol/L)" và
+    // dùng hnumberbox/dx-number-box. Vẫn hỗ trợ nhãn cũ; nếu chỉ còn
+    // "Glucose" thì phải tách Glucose máu khỏi Glucose niệu.
+    function findBloodGlucoseLabelElements(scope) {
+        for (const alias of ['Đường máu bất kỳ', 'Đường máu', 'Glucose máu', 'Glucose bất kỳ']) {
+            const exact = findLabelElements(alias).filter(el => isInScope(el, scope));
+            if (exact.length) return exact;
+        }
+
+        const glucoseLabels = findLabelElements('Glucose').filter(el => isInScope(el, scope));
+        if (!glucoseLabels.length) return [];
+
+        const urineBoundary = [
+            ...findLabelElements('Tỉ trọng'),
+            ...findLabelElements('pH')
+        ].filter(el => isInScope(el, scope)).sort((a, b) =>
+            a === b ? 0 : (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1)
+        )[0] || null;
+
+        if (urineBoundary) {
+            const beforeUrine = glucoseLabels.filter(el =>
+                !!(el.compareDocumentPosition(urineBoundary) & Node.DOCUMENT_POSITION_FOLLOWING)
+            );
+            if (beforeUrine.length) return [beforeUrine[0]];
+        }
+        return [glucoseLabels[0]];
+    }
+
     function findNumberedHeaders() {
         return [...document.querySelectorAll('b,strong,h1,h2,h3,h4,h5,h6,.card-title,.panel-title')]
             .filter(isVisibleElement)
@@ -1441,6 +1470,88 @@ Tổng ERROR: ${errors.length}`;
         return val;
     }
 
+
+    // Glucose máu cần cơ chế riêng vì control mới là hnumberbox/dx-number-box.
+    // Ưu tiên ghi trực tiếp vào dxNumberBox instance để Angular nhận state thật;
+    // nếu portal không expose instance thì fallback sang chuỗi event như người gõ.
+    async function setBloodGlucoseValue(input, rawValue) {
+        if (!input) return false;
+        const val = String(rawValue ?? '').trim();
+        if (!val) return false;
+
+        const numericValue = parseNumberLoose(val);
+        if (!Number.isFinite(numericValue)) return false;
+        const displayVal = formatNumberForMedinet(val);
+
+        CLS_WRITES.pending++;
+        try {
+            const numberBoxEl = input.closest('.dx-numberbox') ||
+                input.closest('dx-number-box') ||
+                input.closest('hnumberbox');
+            let instance = null;
+
+            if (numberBoxEl) {
+                try {
+                    instance = window.DevExpress?.ui?.dxNumberBox?.getInstance?.(numberBoxEl) || null;
+                } catch (_) {}
+                if (!instance) {
+                    try {
+                        const jq = window.jQuery || window.$;
+                        if (jq?.fn?.dxNumberBox) instance = jq(numberBoxEl).dxNumberBox('instance');
+                    } catch (_) {}
+                }
+            }
+
+            if (instance?.option) {
+                try {
+                    instance.option('value', numericValue);
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+                    await sleep(60);
+                    const committed = Number(instance.option('value'));
+                    if (Number.isFinite(committed) && Math.abs(committed - numericValue) < 0.000001) {
+                        return true;
+                    }
+                } catch (e) {
+                    warn('Glucose máu: set dxNumberBox instance thất bại:', e);
+                }
+            }
+
+            input.focus();
+            try { input.select(); } catch (_) {}
+            nativeInputSetter.call(input, '');
+            input.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'deleteContentBackward', data: null
+            }));
+            nativeInputSetter.call(input, displayVal);
+            input.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText', data: displayVal
+            }));
+            input.dispatchEvent(new KeyboardEvent('keyup', {
+                bubbles: true, key: 'Enter', code: 'Enter'
+            }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.blur();
+            input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            await sleep(80);
+
+            // Hidden input chỉ đồng bộ phụ sau khi control hiển thị đã nhận giá trị.
+            if (numberBoxEl) {
+                const hidden = numberBoxEl.querySelector('input[type="hidden"]');
+                if (hidden) {
+                    hidden.value = String(numericValue);
+                    hidden.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+            return String(input.value || '').trim() !== '';
+        } finally {
+            CLS_WRITES.pending = Math.max(0, CLS_WRITES.pending - 1);
+            CLS_WRITES.completed++;
+            CLS_WRITES.lastCompletedAt = Date.now();
+        }
+    }
+
     async function setQualitative(inputInfo, raw) {
         // Giữ đúng nguyên cơ chế Auto KSKTD: với nhóm định tính niệu, thử
         // "Negative" khi giá trị nguồn = 0. Nếu control không nhận chữ
@@ -1553,7 +1664,10 @@ Tổng ERROR: ${errors.length}`;
             for (const f of FIELD_MAP) {
                 const raw = getData(data, f.column);
                 if (raw === undefined || raw === '') continue;
-                const label = findLabelElements(f.label).find(el => isInScope(el, scope));
+                const labels = f.column === 'Glucose'
+                    ? findBloodGlucoseLabelElements(scope)
+                    : findLabelElements(f.label).filter(el => isInScope(el, scope));
+                const label = labels[0] || null;
                 const input = label ? findNumberInputForLabel(label)?.element : null;
                 if (!input || !input.isConnected || !isVisibleElement(input) || input.disabled) {
                     missing.push(f.label);
@@ -1619,7 +1733,10 @@ Tổng ERROR: ${errors.length}`;
             for (const f of FIELD_MAP) {
                 const raw = getData(data, f.column);
                 if (raw === undefined || raw === '') continue;
-                const label = findLabelElements(f.label).find(el => isInScope(el, scope));
+                const labels = f.column === 'Glucose'
+                    ? findBloodGlucoseLabelElements(scope)
+                    : findLabelElements(f.label).filter(el => isInScope(el, scope));
+                const label = labels[0] || null;
                 const input = label ? findNumberInputForLabel(label)?.element : null;
                 const displayed = String(input?.value ?? '').trim();
                 if (!input || !input.isConnected || !displayed) {
@@ -1694,7 +1811,9 @@ Tổng ERROR: ${errors.length}`;
 
         for (const f of FIELD_MAP) {
             if (document.hidden) throw new Error('TAB_HIDDEN: tạm dừng điền CLS.');
-            const labels = findLabelElements(f.label).filter(el => isInScope(el, scope));
+            const labels = f.column === 'Glucose'
+                ? findBloodGlucoseLabelElements(scope)
+                : findLabelElements(f.label).filter(el => isInScope(el, scope));
             if (!labels.length) { notFound.push(f.label); continue; }
             const info = findNumberInputForLabel(labels[0]);
             if (!info) { notFound.push(f.label); continue; }
@@ -1703,6 +1822,7 @@ Tổng ERROR: ${errors.length}`;
             const value = raw;
             const setter = async () => {
                 if (QUALITATIVE_URINE_COLUMNS.includes(f.column)) return await setQualitative(info, value);
+                if (f.column === 'Glucose') return await setBloodGlucoseValue(info.element, value);
                 return await setNumberValue(info.element, value);
             };
             await setter();
