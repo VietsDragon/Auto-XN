@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Auto CLS M3 Batch Clean
-// @namespace    medinet-auto-cls-m3-batch-clean
-// @version      1.5.1
-// @description  M3: tìm XN theo Họ tên + ngày XN, điền/lưu CLS, mở/lưu Kết luận, quay lại danh sách và tiếp tục batch.
+// @name         Auto CLS M3/M4 Smart Batch
+// @namespace    medinet-auto-cls-m3-m4-smart-batch
+// @version      2.0.11
+// @description  Tự nhận diện M3/M4: tìm XN theo Họ tên + ngày XN, điền/lưu CLS, mở/lưu Kết luận, quay lại danh sách và tiếp tục batch.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
 // @run-at       document-idle
@@ -16,7 +16,7 @@
     // CẢNH BÁO / TRIẾT LÝ AN TOÀN
     // =====================================================================
     // - Script CHỈ khởi chạy khi người dùng bấm nút.
-    // - Chỉ dùng trên DANH SÁCH M3 đã lọc "Chưa có cận lâm sàng".
+    // - Dùng trên DANH SÁCH M3 hoặc M4 đã lọc "Chưa có cận lâm sàng".
     // - Một ca chỉ được tính DONE sau chuỗi:
     //     điền CLS -> Lưu CLS -> mở Kết luận -> Lưu Kết luận
     //     -> quay về Danh sách -> chờ bảng tải ổn định -> tiếp tục ca kế.
@@ -24,7 +24,7 @@
     // - Lỗi kỹ thuật => RETRY giới hạn, sau đó ghi ERROR và tiếp tục.
     // - Không tự đoán kết quả xét nghiệm.
 
-    const LOG = '[AUTO CLS M3 BATCH]';
+    const LOG = '[AUTO CLS SMART BATCH]';
 
     // =====================================================================
     // NGUỒN DỮ LIỆU XÉT NGHIỆM - GIỮ NGUYÊN TỪ SCRIPT AUTO KSK TD
@@ -78,18 +78,56 @@
     // =====================================================================
 
     // Namespace mới: tuyệt đối không tiếp tục stage dở của chuỗi v0.1.x.
-    const KEY_ACTIVE = 'm3_cls_clean_active_v100';
-    const KEY_STAGE = 'm3_cls_clean_stage_v100';
-    const KEY_CASE = 'm3_cls_clean_case_v100';
-    const KEY_STATS = 'm3_cls_clean_stats_v100';
+    const KEY_ACTIVE = 'm34_cls_smart_active_v200';
+    const KEY_STAGE = 'm34_cls_smart_stage_v200';
+    const KEY_CASE = 'm34_cls_smart_case_v200';
+    const KEY_STATS = 'm34_cls_smart_stats_v200';
     // Namespace mới để không mang theo các ca SKIP tích lũy từ những lần chạy
     // v1.0-v1.3.4. SKIP được giữ lại để tránh chạy lại ngoài ý muốn.
-    const KEY_SKIPPED = 'm3_cls_clean_skipped_v135';
-    const KEY_DONE = 'm3_cls_clean_done_v100';
-    const KEY_ERRORS = 'm3_cls_clean_errors_v100';
-    const KEY_RETRIES = 'm3_cls_clean_retries_v100';
-    const KEY_LAST_URL = 'm3_cls_clean_last_url_v100';
-    const KEY_RELOAD_COUNT = 'm3_cls_clean_reload_count_v100';
+    const KEY_SKIPPED = 'm34_cls_smart_skipped_v200';
+    const KEY_DONE = 'm34_cls_smart_done_v200';
+    const KEY_ERRORS = 'm34_cls_smart_errors_v200';
+    const KEY_RETRIES = 'm34_cls_smart_retries_v200';
+    const KEY_LAST_URL = 'm34_cls_smart_last_url_v200';
+    const KEY_UI_MODE = 'm34_cls_smart_ui_mode_v202';
+    const KEY_RELOAD_COUNT = 'm34_cls_smart_reload_count_v200';
+    // Mẫu hiện tại được ghi nhớ theo tab để khi từ danh sách đi vào hồ sơ
+    // URL chi tiết vẫn biết chính xác đang chạy M3 hay M4.
+    const KEY_MODEL = 'm34_cls_smart_model_v200';
+
+    const MODEL_ROUTE = {
+        M3_LIST: ['KSKDK_DanhSach_KSK_M13', 'KSKDK_DanhSach_KSK_M3'],
+        M4_LIST: ['KSKDK_DanhSach_KSK_NguoiCaoTuoi_Report'],
+        M4_DETAIL: ['/kskdk_NguoiCaoTuoi/', 'KNCT_', 'mauphieunct']
+    };
+
+    function detectModelFromLocation() {
+        const u = location.href || '';
+        if (MODEL_ROUTE.M3_LIST.some(x => u.includes(x))) return 'M3';
+        if (MODEL_ROUTE.M4_LIST.some(x => u.includes(x))) return 'M4';
+        if (MODEL_ROUTE.M4_DETAIL.some(x => u.includes(x))) return 'M4';
+
+        const body = norm(document.body?.innerText || '');
+        // Chỉ dùng body khi có dấu hiệu trang danh sách/hồ sơ đủ đặc hiệu.
+        if (body.includes('nguoi cao tuoi') && (body.includes('chat luong du lieu') || body.includes('thong tin doi tuong kham'))) return 'M4';
+        if ((body.includes('18 - 59') || body.includes('18-59') || body.includes('du 18')) && body.includes('chat luong du lieu')) return 'M3';
+        return '';
+    }
+
+    function rememberDetectedModel() {
+        const detected = detectModelFromLocation();
+        if (detected) sessionStorage.setItem(KEY_MODEL, detected);
+        return detected;
+    }
+
+    function getCurrentModel() {
+        return rememberDetectedModel() || sessionStorage.getItem(KEY_MODEL) || '';
+    }
+
+    function getModelLabel() {
+        return getCurrentModel() || 'M3/M4';
+    }
+
     // Đổi sau mỗi lần trình duyệt tải lại toàn trang. Được lưu vào ca trước khi
     // bấm Lưu CLS để nhận biết chính xác lần reload đã hoàn tất.
     const PAGE_INSTANCE_ID = `P-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -338,8 +376,9 @@
 
     function caseKey(c) {
         if (!c) return '';
-        if (c.cccd) return `CCCD:${c.cccd}|DATE:${c.ngayKham || ''}`;
-        return `NAME:${norm(c.hoTen)}|DOB:${c.ngaySinh || ''}|SEX:${norm(c.gioiTinh)}|DATE:${c.ngayKham || ''}`;
+        const model = c.model || getCurrentModel() || 'UNKNOWN';
+        if (c.cccd) return `${model}|CCCD:${c.cccd}|DATE:${c.ngayKham || ''}`;
+        return `${model}|NAME:${norm(c.hoTen)}|DOB:${c.ngaySinh || ''}|SEX:${norm(c.gioiTinh)}|DATE:${c.ngayKham || ''}`;
     }
 
     // Bản 1.5 chỉ chạy một tab: bỏ toàn bộ claim/lease/worker để state đơn giản và ổn định hơn.
@@ -407,6 +446,23 @@
         return all[k];
     }
 
+
+    function getUiMode() {
+        try {
+            return localStorage.getItem(KEY_UI_MODE) || 'expanded';
+        } catch (_) {
+            return 'expanded';
+        }
+    }
+
+    function setUiMode(mode) {
+        try {
+            localStorage.setItem(KEY_UI_MODE, mode === 'collapsed' ? 'collapsed' : 'expanded');
+        } catch (_) {}
+        updatePanel();
+        positionBatchBubble();
+    }
+
     // =====================================================================
     // UI
     // =====================================================================
@@ -416,60 +472,185 @@
         const style = document.createElement('style');
         style.id = 'm3-cls-batch-style';
         style.textContent = `
-            #m3-cls-batch-panel{position:fixed;right:18px;bottom:18px;z-index:9999999;width:315px;background:#fff;border:1px solid #cbd5e1;border-radius:14px;box-shadow:0 12px 35px rgba(0,0,0,.28);font-family:Segoe UI,Arial,sans-serif;overflow:hidden}
-            #m3-cls-batch-panel .h{background:#173f78;color:#fff;padding:11px 13px;font-weight:750;font-size:13px;display:flex;justify-content:space-between;align-items:center}
-            #m3-cls-batch-panel .b{padding:11px 13px;font-size:12.5px;color:#334155;line-height:1.45}
-            #m3-cls-batch-panel .row{display:flex;justify-content:space-between;gap:10px;margin:3px 0}.m3cls-ok{color:#15803d;font-weight:700}.m3cls-warn{color:#b45309;font-weight:700}.m3cls-bad{color:#b91c1c;font-weight:700}
-            #m3-cls-batch-panel .actions{display:flex;gap:7px;padding:0 13px 12px}
-            #m3-cls-batch-panel button{border:0;border-radius:8px;padding:8px 10px;font-size:12px;font-weight:700;cursor:pointer}
-            #m3cls-start{background:#2563eb;color:white;flex:1}#m3cls-stop{background:#dc2626;color:white;flex:1}#m3cls-report{background:#e2e8f0;color:#334155}#m3cls-reset-skip{background:#fef3c7;color:#92400e}
-            #m3cls-status{position:fixed;top:0;left:0;right:0;z-index:9999998;background:#0f172a;color:white;text-align:center;padding:8px;font:600 13px Segoe UI,Arial,sans-serif;display:none}
-            #m3cls-report-overlay{position:fixed;inset:0;z-index:10000020;background:rgba(15,23,42,.58);display:flex;align-items:center;justify-content:center;padding:24px;font-family:Segoe UI,Arial,sans-serif}
-            #m3cls-report-box{width:min(920px,95vw);height:min(760px,90vh);background:#fff;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.38);display:flex;flex-direction:column;overflow:hidden}
-            #m3cls-report-head{padding:13px 16px;background:#173f78;color:#fff;font-weight:750;display:flex;justify-content:space-between;align-items:center}
-            #m3cls-report-text{flex:1;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0;padding:16px;font:13px/1.5 Consolas,monospace;color:#172033;background:#f8fafc}
-            #m3cls-report-actions{display:flex;justify-content:flex-end;gap:8px;padding:11px 14px;border-top:1px solid #e2e8f0}
-            #m3cls-report-actions button{border:0;border-radius:8px;padding:9px 13px;font-weight:700;cursor:pointer}#m3cls-copy-all{background:#2563eb;color:#fff}#m3cls-clear-errors{background:#fee2e2;color:#991b1b}#m3cls-close-report{background:#e2e8f0;color:#334155}
+            #m3-cls-batch-panel{
+                position:fixed;right:14px;bottom:10px;z-index:9999999;width:328px;
+                color:#effbff;background:linear-gradient(160deg,rgba(4,12,24,.97),rgba(7,20,38,.96));
+                border:1px solid rgba(71,226,255,.30);border-radius:20px;
+                box-shadow:0 18px 42px rgba(2,6,23,.42),0 0 0 1px rgba(255,255,255,.03) inset,0 0 24px rgba(34,211,238,.10);
+                backdrop-filter:blur(14px);font-family:'Segoe UI',Roboto,Arial,sans-serif;overflow:hidden;
+                transition:opacity .18s ease,transform .18s ease;
+            }
+            #m3-cls-batch-panel.m3cls-hidden{display:none!important}
+            #m3-cls-batch-panel.m3cls-collapsed{display:none!important}
+            #m3-cls-batch-panel .h{display:grid;grid-template-columns:54px 1fr auto;gap:11px;align-items:center;padding:12px 14px 10px;border-bottom:1px solid rgba(148,163,184,.12);background:linear-gradient(90deg,rgba(8,47,73,.62),rgba(2,6,23,.16))}
+            #m3-cls-batch-panel .m3cls-reactor{position:relative;width:48px;height:48px;border-radius:50%;display:grid;place-items:center;isolation:isolate;flex:none}
+            #m3-cls-batch-panel .m3cls-reactor::before{content:'';position:absolute;inset:1px;border-radius:50%;background:repeating-conic-gradient(from 0deg,#6ee7f9 0 10deg,#155e75 10deg 19deg,#082f49 19deg 29deg,#164e63 29deg 34deg);box-shadow:0 0 0 3px #020617 inset,0 0 14px rgba(34,211,238,.42);animation:m3cls-idle-spin 4.8s linear infinite}
+            #m3-cls-batch-panel.m3cls-running .m3cls-reactor::before{animation-duration:.9s;box-shadow:0 0 0 3px #020617 inset,0 0 18px rgba(34,211,238,.85)}
+            #m3-cls-batch-panel .m3cls-reactor::after{content:'';position:absolute;inset:10px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#145369,#07111f 64%);border:1px solid rgba(165,243,252,.52);z-index:2}
+            #m3-cls-batch-panel .m3cls-reactor b{position:relative;z-index:4;font-size:14px;font-weight:900;color:#ecfeff;text-shadow:0 0 8px rgba(103,232,249,.72)}
+            @keyframes m3cls-idle-spin{to{rotate:360deg}}
+            #m3-cls-batch-panel .m3cls-title{min-width:0}
+            .m3cls-title-main{font-size:14px;font-weight:900;letter-spacing:.45px;color:#f8fdff}
+            .m3cls-title-sub{font-size:11px;color:#9be7ff;margin-top:2px;font-weight:700;letter-spacing:.22px}
+            #m3-cls-batch-panel .m3cls-header-tools{display:flex;align-items:center;gap:8px}
+            #m3-cls-batch-panel .m3cls-state{font-size:10.5px;font-weight:900;padding:5px 8px;border-radius:999px;border:1px solid rgba(125,211,252,.28);background:rgba(14,116,144,.16);color:#bdf4ff;white-space:nowrap}
+            #m3-cls-batch-panel.m3cls-running .m3cls-state{color:#ecfeff;background:rgba(8,145,178,.28);box-shadow:0 0 12px rgba(34,211,238,.16)}
+            #m3-cls-batch-panel .m3cls-toggle{width:30px;height:30px;border-radius:10px;border:1px solid rgba(148,163,184,.16);background:rgba(15,23,42,.74);color:#dff9ff;font-size:16px;font-weight:900;display:grid;place-items:center;cursor:pointer;box-shadow:0 4px 12px rgba(2,6,23,.22)}
+            #m3-cls-batch-panel .m3cls-toggle:hover{filter:brightness(1.08)}
+            #m3-cls-batch-panel .b{padding:12px 14px 10px;font-size:12.8px;color:#dceaf6;line-height:1.48}
+            #m3-cls-batch-panel .m3cls-statusline{padding:9px 11px;margin-bottom:10px;border-radius:12px;background:rgba(10,18,34,.86);border:1px solid rgba(103,232,249,.13);color:#f2fbff;min-height:40px;display:flex;align-items:center;font-size:12.5px;font-weight:700;letter-spacing:.1px}
+            #m3-cls-batch-panel .m3cls-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+            #m3-cls-batch-panel .m3cls-card{padding:9px 10px;border-radius:12px;background:rgba(15,23,42,.62);border:1px solid rgba(148,163,184,.10)}
+            #m3-cls-batch-panel .m3cls-card span{display:block;font-size:10px;color:#9cb3c7;text-transform:uppercase;letter-spacing:.38px}
+            .m3cls-card b{display:block;margin-top:2px;font-size:16px;line-height:1.15;color:#f8fafc}
+            .m3cls-card .m3cls-ok{color:#86efac}.m3cls-card .m3cls-warn{color:#fcd34d}.m3cls-card .m3cls-bad{color:#fda4af}
+            #m3-cls-batch-panel .m3cls-mini{display:flex;justify-content:space-between;gap:8px;margin-top:9px;padding-top:8px;border-top:1px solid rgba(148,163,184,.11);font-size:11.2px;color:#9eb2c5}.m3cls-mini strong{color:#f8fafc;font-weight:800}
+            #m3-cls-batch-panel .m3cls-patient{margin-top:9px;padding:9px 10px;border-radius:12px;background:linear-gradient(90deg,rgba(8,47,73,.42),rgba(15,23,42,.48));border:1px solid rgba(34,211,238,.12)}
+            #m3cls-patient{display:block;color:#fff;font-size:12.3px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+            #m3cls-detail{font-size:10.8px;color:#a9bed1;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+            #m3-cls-batch-panel .actions{display:grid;grid-template-columns:1fr 1fr 40px 58px;gap:7px;padding:0 14px 14px}
+            #m3-cls-batch-panel button{height:36px;border:1px solid rgba(148,163,184,.13);border-radius:11px;font-size:11px;font-weight:850;cursor:pointer;font-family:inherit;transition:transform .12s ease,filter .12s ease,box-shadow .12s ease}
+            #m3-cls-batch-panel button:hover{transform:translateY(-1px);filter:brightness(1.08)}
+            #m3cls-start{background:linear-gradient(135deg,#0891b2,#2563eb);color:#fff;box-shadow:0 5px 14px rgba(37,99,235,.18)}
+            #m3cls-stop{background:linear-gradient(135deg,#7f1d1d,#dc2626);color:#fff}
+            #m3cls-report{background:#111c2d;color:#bae6fd}
+            #m3cls-reset-skip{background:#241b0b;color:#fde68a}
+            #m3cls-status{display:none!important}
+            #m3cls-report-overlay{position:fixed;inset:0;z-index:10000020;background:rgba(2,6,23,.72);display:flex;align-items:center;justify-content:center;padding:24px;font-family:Segoe UI,Arial,sans-serif;backdrop-filter:blur(7px)}
+            #m3cls-report-box{width:min(920px,95vw);height:min(760px,90vh);background:#07111f;color:#e2e8f0;border:1px solid rgba(103,232,249,.24);border-radius:18px;box-shadow:0 24px 70px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden}
+            #m3cls-report-head{padding:13px 16px;background:linear-gradient(90deg,#0c4a6e,#172554);color:#fff;font-weight:800;display:flex;justify-content:space-between;align-items:center}
+            #m3cls-report-text{flex:1;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0;padding:16px;font:12.5px/1.55 Consolas,monospace;color:#dbeafe;background:#07111f}
+            #m3cls-report-actions{display:flex;justify-content:flex-end;gap:8px;padding:11px 14px;border-top:1px solid rgba(148,163,184,.13)}
+            #m3cls-report-actions button{border:0;border-radius:9px;padding:9px 13px;font-weight:800;cursor:pointer}
+            #m3cls-copy-all{background:#0891b2;color:#fff}#m3cls-clear-errors{background:#3f1218;color:#fecdd3}#m3cls-close-report{background:#162236;color:#cbd5e1}
+            #m3cls-bubble{position:fixed;right:20px;bottom:352px;z-index:10000012;width:min(372px,calc(100vw - 36px));background:#fff;color:#111827;border:2px solid #0f172a;border-radius:18px 18px 18px 10px;box-shadow:0 18px 40px rgba(2,6,23,.28);font-family:'Segoe UI',Roboto,Arial,sans-serif;opacity:0;transform:scale(.96);transform-origin:90% 100%;transition:opacity .12s ease,transform .12s ease;overflow:visible}
+            #m3cls-bubble.show{opacity:1;transform:scale(1)}
+            #m3cls-bubble::after{content:'';position:absolute;right:28px;bottom:-13px;width:22px;height:22px;background:#fff;border-right:2px solid #0f172a;border-bottom:2px solid #0f172a;transform:rotate(45deg);border-radius:0 0 4px 0}
+            #m3cls-bubble.warn{background:#fff9e8;border-color:#7c2d12}#m3cls-bubble.warn::after{background:#fff9e8;border-color:#7c2d12}
+            #m3cls-bubble.error{background:#fff1f2;border-color:#991b1b}#m3cls-bubble.error::after{background:#fff1f2;border-color:#991b1b}
+            #m3cls-bubble.ok{background:#f0fdf4;border-color:#166534}#m3cls-bubble.ok::after{background:#f0fdf4;border-color:#166534}
+            #m3cls-bubble .bb-head{display:flex;gap:9px;align-items:flex-start;padding:13px 14px 7px;position:relative;z-index:2}.bb-dot{width:10px;height:10px;border-radius:50%;margin-top:4px;background:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.15)}
+            #m3cls-bubble.warn .bb-dot{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.15)}#m3cls-bubble.error .bb-dot{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.15)}#m3cls-bubble.ok .bb-dot{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.15)}
+            #m3cls-bubble .bb-title{font-size:14px;font-weight:900;line-height:1.3;color:#0f172a}.bb-body{padding:0 14px 13px;font-size:13px;line-height:1.56;white-space:pre-line;color:#334155;position:relative;z-index:2}.bb-actions{display:flex;justify-content:flex-end;gap:7px;padding:0 14px 13px;position:relative;z-index:2}.bb-actions button{border:0;border-radius:10px;padding:8px 12px;font-size:11.5px;font-weight:850;cursor:pointer;font-family:inherit}.bb-secondary{background:#e2e8f0;color:#334155}.bb-primary{background:linear-gradient(135deg,#0891b2,#2563eb);color:white}.bb-danger{background:#dc2626;color:white}
+            #m3cls-fab{position:fixed;right:14px;bottom:12px;z-index:10000001;width:72px;height:72px;border-radius:50%;display:none;place-items:center;cursor:pointer;background:radial-gradient(circle at 35% 30%,rgba(8,47,73,.98),rgba(2,6,23,.98) 68%);border:1px solid rgba(71,226,255,.32);box-shadow:0 18px 42px rgba(2,6,23,.42),0 0 0 1px rgba(255,255,255,.03) inset,0 0 24px rgba(34,211,238,.10);backdrop-filter:blur(14px)}
+            #m3cls-fab.show{display:grid}
+            #m3cls-fab .m3cls-reactor{width:56px;height:56px}
+            #m3cls-fab .m3cls-reactor::before{animation-duration:4.8s}
+            #m3cls-fab.m3cls-running .m3cls-reactor::before{animation-duration:.9s;box-shadow:0 0 0 3px #020617 inset,0 0 18px rgba(34,211,238,.85)}
+            #m3cls-fab .m3cls-reactor::after{inset:12px}
+            #m3cls-fab .m3cls-reactor b{font-size:14px}
+            #m3cls-fab .m3cls-fab-label{position:absolute;bottom:-16px;left:50%;transform:translateX(-50%);font-size:10px;font-weight:800;color:#c9f7ff;white-space:nowrap;text-shadow:0 2px 6px rgba(2,6,23,.55)}
+            @media(max-width:640px){#m3-cls-batch-panel{right:8px;bottom:8px;width:286px}.m3cls-title-main{font-size:13px}#m3cls-bubble{right:10px;width:min(310px,calc(100vw - 20px))}#m3cls-fab{right:8px;bottom:8px;width:68px;height:68px}}
         `;
         document.head.appendChild(style);
+
+        // v2.0.5: FAB thu nhỏ có reactor độc lập, không phụ thuộc CSS của panel lớn.
+        if (!document.getElementById('m3cls-fab-v205-style')) {
+            const fabStyle = document.createElement('style');
+            fabStyle.id = 'm3cls-fab-v205-style';
+            fabStyle.textContent = `
+                #m3cls-fab{
+                    width:72px!important;height:72px!important;border-radius:50%!important;
+                    background:radial-gradient(circle at 40% 30%,#123b52 0,#071827 48%,#020617 78%)!important;
+                    border:2px solid rgba(103,232,249,.62)!important;
+                    box-shadow:0 12px 30px rgba(2,6,23,.42),0 0 22px rgba(34,211,238,.30)!important;
+                    overflow:visible!important;padding:0!important;color:#ecfeff!important;
+                }
+                #m3cls-fab .m3cls-reactor{
+                    position:relative!important;width:58px!important;height:58px!important;border-radius:50%!important;
+                    display:grid!important;place-items:center!important;isolation:isolate!important;
+                }
+                #m3cls-fab .m3cls-reactor::before{
+                    content:''!important;position:absolute!important;inset:0!important;border-radius:50%!important;
+                    background:repeating-conic-gradient(from 0deg,#9bf6ff 0 8deg,#22d3ee 8deg 13deg,#155e75 13deg 23deg,#082f49 23deg 31deg)!important;
+                    box-shadow:0 0 0 4px #020617 inset,0 0 16px rgba(34,211,238,.60)!important;
+                    animation:m3cls-fab-spin 4.4s linear infinite!important;
+                }
+                #m3cls-fab.m3cls-running .m3cls-reactor::before{
+                    animation-duration:.72s!important;
+                    box-shadow:0 0 0 4px #020617 inset,0 0 24px rgba(34,211,238,.95)!important;
+                }
+                #m3cls-fab .m3cls-reactor::after{
+                    content:''!important;position:absolute!important;inset:13px!important;border-radius:50%!important;
+                    background:radial-gradient(circle at 35% 30%,#1d6078,#06111f 66%)!important;
+                    border:1px solid rgba(207,250,254,.58)!important;z-index:2!important;
+                }
+                #m3cls-fab .m3cls-reactor b{
+                    position:relative!important;z-index:5!important;color:#f8fdff!important;font-size:15px!important;
+                    font-weight:950!important;text-shadow:0 0 9px rgba(103,232,249,.95)!important;
+                }
+                #m3cls-fab .m3cls-fab-label{
+                    bottom:-18px!important;color:#d8faff!important;background:rgba(2,6,23,.88)!important;
+                    border:1px solid rgba(103,232,249,.22)!important;border-radius:999px!important;
+                    padding:2px 7px!important;font-size:9px!important;letter-spacing:.35px!important;
+                }
+                @keyframes m3cls-fab-spin{to{rotate:360deg}}
+            `;
+            document.head.appendChild(fabStyle);
+        }
     }
 
     function ensurePanel() {
         ensureStyles();
-        if (document.getElementById('m3-cls-batch-panel')) return;
+        if (document.getElementById('m3-cls-batch-panel')) {
+            updatePanel();
+            return;
+        }
         const p = document.createElement('div');
         p.id = 'm3-cls-batch-panel';
         p.innerHTML = `
-            <div class="h"><span>🤖 AUTO SỬA CLS M3</span><span id="m3cls-active-label">DỪNG</span></div>
-            <div class="b">
-                <div class="row"><span>Trạng thái</span><b id="m3cls-stage">-</b></div>
-                <div class="row"><span>Đã xử lý</span><b id="m3cls-processed">0</b></div>
-                <div class="row"><span>Hoàn tất</span><span id="m3cls-done" class="m3cls-ok">0</span></div>
-                <div class="row"><span>Bỏ qua</span><span id="m3cls-skipped" class="m3cls-warn">0</span></div>
-                <div class="row"><span>↳ Không tìm thấy XN</span><span id="m3cls-notfound">0</span></div>
-                <div class="row"><span>↳ Trùng kết quả</span><span id="m3cls-dup">0</span></div>
-                <div class="row"><span>↳ Không hợp lệ</span><span id="m3cls-invalid">0</span></div>
-                <div class="row"><span>Lỗi ghi nhận</span><span id="m3cls-errors" class="m3cls-bad">0</span></div>
-                <div class="row"><span>Retry</span><span id="m3cls-retries">0</span></div>
-                <div class="row"><span>Tỷ lệ hoàn tất</span><b id="m3cls-success">—</b></div>
-                <div class="row"><span>Tốc độ TB</span><span id="m3cls-speed">—</span></div>
-                <div class="row"><span>Đã chạy</span><span id="m3cls-elapsed">—</span></div>
-                <div style="margin-top:7px;padding-top:7px;border-top:1px solid #e2e8f0"><b id="m3cls-patient">Chưa chạy</b><div id="m3cls-detail" style="color:#64748b;margin-top:2px"></div></div>
+            <div class="h">
+                <div class="m3cls-reactor"><b id="m3cls-model">M?</b></div>
+                <div class="m3cls-title"><div class="m3cls-title-main">AUTO CLS SMART</div><div class="m3cls-title-sub">MEDINET · M3 / M4</div></div>
+                <div class="m3cls-header-tools"><span id="m3cls-active-label" class="m3cls-state">SẴN SÀNG</span><button id="m3cls-toggle" class="m3cls-toggle" type="button" title="Thu nhỏ">—</button></div>
             </div>
-            <div class="actions"><button id="m3cls-start">▶ BẮT ĐẦU</button><button id="m3cls-stop">⏹ DỪNG</button><button id="m3cls-report">📋</button><button id="m3cls-reset-skip" title="Xóa danh sách SKIP để chạy lại">↻ SKIP</button></div>
-        `;
+            <div class="b">
+                <div id="m3cls-status-line" class="m3cls-statusline">Đang nhận diện mẫu...</div>
+                <div class="m3cls-grid">
+                    <div class="m3cls-card"><span>Đã xử lý</span><b id="m3cls-processed">0</b></div>
+                    <div class="m3cls-card"><span>Hoàn tất</span><b id="m3cls-done" class="m3cls-ok">0</b></div>
+                    <div class="m3cls-card"><span>Bỏ qua</span><b id="m3cls-skipped" class="m3cls-warn">0</b></div>
+                    <div class="m3cls-card"><span>Lỗi</span><b id="m3cls-errors" class="m3cls-bad">0</b></div>
+                </div>
+                <div class="m3cls-mini"><span>Retry <strong id="m3cls-retries">0</strong></span><span>Hoàn tất <strong id="m3cls-success">—</strong></span><span id="m3cls-speed">—</span></div>
+                <div class="m3cls-patient"><b id="m3cls-patient">Chưa có ca</b><div id="m3cls-detail"></div></div>
+                <span id="m3cls-stage" style="display:none">-</span>
+                <span id="m3cls-notfound" style="display:none">0</span><span id="m3cls-dup" style="display:none">0</span><span id="m3cls-invalid" style="display:none">0</span><span id="m3cls-elapsed" style="display:none">—</span>
+            </div>
+            <div class="actions"><button id="m3cls-start">▶ CHẠY</button><button id="m3cls-stop">■ DỪNG</button><button id="m3cls-report" title="Báo cáo">📋</button><button id="m3cls-reset-skip" title="Xóa SKIP để chạy lại">↻ SKIP</button></div>`;
         document.body.appendChild(p);
+
+        const fab = document.createElement('button');
+        fab.id = 'm3cls-fab';
+        fab.type = 'button';
+        fab.innerHTML = `<div class="m3cls-reactor"><b id="m3cls-fab-model">M?</b></div><span class="m3cls-fab-label" id="m3cls-fab-label">MỞ</span>`;
+        document.body.appendChild(fab);
 
         document.getElementById('m3cls-start').addEventListener('click', startBatch);
         document.getElementById('m3cls-stop').addEventListener('click', stopBatch);
         document.getElementById('m3cls-report').addEventListener('click', showReport);
         document.getElementById('m3cls-reset-skip').addEventListener('click', resetSkippedList);
+        document.getElementById('m3cls-toggle').addEventListener('click', () => setUiMode('collapsed'));
+        fab.addEventListener('click', () => setUiMode('expanded'));
         updatePanel();
     }
 
     function updatePanel() {
         const p = document.getElementById('m3-cls-batch-panel');
+        const fab = document.getElementById('m3cls-fab');
         if (!p) return;
+        const model = getCurrentModel();
+        const uiMode = getUiMode();
+        const collapsed = uiMode === 'collapsed';
+        // Chỉ hiện trên M3/M4 hoặc khi một batch đang chạy qua route con.
+        p.classList.toggle('m3cls-hidden', !model && !isActive());
+        p.classList.toggle('m3cls-running', isActive());
+        p.classList.toggle('m3cls-collapsed', collapsed);
+        if (fab) {
+            fab.classList.toggle('show', collapsed && (!!model || isActive()));
+            fab.classList.toggle('m3cls-running', isActive());
+        }
+
         const s = getStats();
         const c = getCase();
         const processed = Number(s.processed || 0);
@@ -480,14 +661,23 @@
         const elapsedMs = s.startedAt ? Math.max(0, Date.now() - s.startedAt) : 0;
         const fmtElapsed = ms => {
             if (!ms) return '—';
-            const sec = Math.floor(ms / 1000);
-            const h = Math.floor(sec / 3600);
-            const m = Math.floor((sec % 3600) / 60);
-            const ss = sec % 60;
+            const sec = Math.floor(ms / 1000), h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), ss = sec % 60;
             return h ? `${h}g ${m}p` : (m ? `${m}p ${ss}s` : `${ss}s`);
         };
 
-        document.getElementById('m3cls-active-label').textContent = isActive() ? 'ĐANG CHẠY' : 'DỪNG';
+        const modelEl = document.getElementById('m3cls-model');
+        if (modelEl) modelEl.textContent = model || 'M?';
+        const fabModel = document.getElementById('m3cls-fab-model');
+        if (fabModel) fabModel.textContent = model || 'M?';
+        const activeLabel = document.getElementById('m3cls-active-label');
+        if (activeLabel) activeLabel.textContent = isActive() ? 'ĐANG CHẠY' : (model ? 'SẴN SÀNG' : 'CHỜ MẪU');
+        const toggleBtn = document.getElementById('m3cls-toggle');
+        if (toggleBtn) {
+            toggleBtn.textContent = collapsed ? '+' : '—';
+            toggleBtn.title = collapsed ? 'Phóng to' : 'Thu nhỏ';
+        }
+        const fabLabel = document.getElementById('m3cls-fab-label');
+        if (fabLabel) fabLabel.textContent = isActive() ? 'ĐANG CHẠY' : 'MỞ';
         document.getElementById('m3cls-stage').textContent = getStage();
         document.getElementById('m3cls-processed').textContent = processed;
         document.getElementById('m3cls-done').textContent = done;
@@ -498,31 +688,87 @@
         document.getElementById('m3cls-errors').textContent = s.errors || 0;
         document.getElementById('m3cls-retries').textContent = s.retries || 0;
         document.getElementById('m3cls-success').textContent = processed ? `${((done / processed) * 100).toFixed(1)}%` : '—';
-        document.getElementById('m3cls-speed').textContent = timedCases && timedMinutes > 0
-            ? `${(timedMinutes / timedCases).toFixed(1)} phút/ca`
-            : '—';
+        document.getElementById('m3cls-speed').textContent = timedCases && timedMinutes > 0 ? `${(timedMinutes / timedCases).toFixed(1)}p/ca` : '—';
         document.getElementById('m3cls-elapsed').textContent = fmtElapsed(elapsedMs);
-        document.getElementById('m3cls-patient').textContent = c ? (c.hoTen || '(không tên)') : 'Chưa có ca';
+        document.getElementById('m3cls-patient').textContent = c ? `${c.hoTen || '(không tên)'} · ${c.model || model || ''}` : `Chưa có ca · ${model || 'M3/M4'}`;
         document.getElementById('m3cls-detail').textContent = c
             ? `${c.cccd || '—'} · khám ${c.ngayKham || '—'} · ${getStage()}`
-            : (s.lastError ? `Lỗi gần nhất: ${s.lastError}` : '');
+            : (s.lastError ? `Lỗi gần nhất: ${s.lastError}` : `Tự nhận diện ${model || 'M3/M4'} theo URL`);
+
+        const start = document.getElementById('m3cls-start');
+        if (start) start.textContent = `▶ CHẠY ${model || ''}`.trim();
+
+        positionBatchBubble();
     }
 
     function showStatus(message) {
-        ensureStyles();
-        let el = document.getElementById('m3cls-status');
-        if (!el) {
-            el = document.createElement('div');
-            el.id = 'm3cls-status';
-            document.body.appendChild(el);
-        }
-        el.textContent = message;
-        el.style.display = 'block';
+        ensurePanel();
+        const el = document.getElementById('m3cls-status-line');
+        if (el) el.textContent = String(message || '');
+        updatePanel();
     }
 
     function hideStatus() {
-        const el = document.getElementById('m3cls-status');
-        if (el) el.style.display = 'none';
+        const el = document.getElementById('m3cls-status-line');
+        if (el) el.textContent = isActive() ? 'Đang xử lý...' : 'Đã dừng.';
+    }
+
+    let bubbleTimer = null;
+
+    function closeBatchBubble() {
+        if (bubbleTimer) { clearTimeout(bubbleTimer); bubbleTimer = null; }
+        const el = document.getElementById('m3cls-bubble');
+        if (!el) return;
+        el.classList.remove('show');
+        setTimeout(() => el.remove(), 120);
+    }
+
+
+    function positionBatchBubble(el = null) {
+        const bubble = el || document.getElementById('m3cls-bubble');
+        if (!bubble) return;
+        const collapsed = getUiMode() === 'collapsed';
+        bubble.style.right = collapsed ? '14px' : '20px';
+        bubble.style.bottom = collapsed ? '92px' : '352px';
+        if (window.innerWidth <= 640) {
+            bubble.style.right = '10px';
+            bubble.style.bottom = collapsed ? '86px' : '344px';
+        }
+    }
+
+    function showBatchBubble(title, message, type = 'info', duration = 4200) {
+        ensurePanel();
+        closeBatchBubble();
+        const el = document.createElement('div');
+        el.id = 'm3cls-bubble';
+        el.className = type;
+        el.innerHTML = `<div class="bb-head"><span class="bb-dot"></span><div class="bb-title"></div></div><div class="bb-body"></div>`;
+        el.querySelector('.bb-title').textContent = String(title || 'Thông báo');
+        el.querySelector('.bb-body').textContent = String(message || '');
+        document.body.appendChild(el);
+        positionBatchBubble(el);
+        requestAnimationFrame(() => el.classList.add('show'));
+        if (duration > 0) bubbleTimer = setTimeout(closeBatchBubble, duration);
+        return el;
+    }
+
+    function confirmBatchBubble(title, message, options = {}) {
+        ensurePanel();
+        closeBatchBubble();
+        return new Promise(resolve => {
+            const el = document.createElement('div');
+            el.id = 'm3cls-bubble';
+            el.className = options.type || 'warn';
+            el.innerHTML = `<div class="bb-head"><span class="bb-dot"></span><div class="bb-title"></div></div><div class="bb-body"></div><div class="bb-actions"><button type="button" class="bb-secondary">${options.cancelText || 'HỦY'}</button><button type="button" class="${options.danger ? 'bb-danger' : 'bb-primary'}">${options.okText || 'XÁC NHẬN'}</button></div>`;
+            el.querySelector('.bb-title').textContent = String(title || 'Xác nhận');
+            el.querySelector('.bb-body').textContent = String(message || '');
+            document.body.appendChild(el);
+            requestAnimationFrame(() => el.classList.add('show'));
+            const buttons = el.querySelectorAll('.bb-actions button');
+            const finish = value => { closeBatchBubble(); resolve(value); };
+            buttons[0].onclick = () => finish(false);
+            buttons[1].onclick = () => finish(true);
+        });
     }
 
     function buildFullReport() {
@@ -539,7 +785,7 @@
         const avg = s.timedCases ? ((s.totalProcessMs || 0) / 60000 / s.timedCases).toFixed(1) + ' phút/ca' : '—';
         const started = s.startedAt ? new Date(s.startedAt).toLocaleString('vi-VN') : '—';
 
-        let txt = `AUTO SỬA CLS M3 v1.5.0 - SINGLE TAB
+        let txt = `AUTO CLS SMART ${getModelLabel()} v2.0.11 - SINGLE TAB
 Bắt đầu: ${started}
 
 === THỐNG KÊ PHIÊN NÀY ===
@@ -577,7 +823,7 @@ Tổng ERROR: ${errors.length}`;
         overlay.id = 'm3cls-report-overlay';
         overlay.innerHTML = `
             <div id="m3cls-report-box">
-                <div id="m3cls-report-head"><span>📋 DANH SÁCH SKIP / ERROR ĐẦY ĐỦ</span><span>${Object.keys(getLocalJson(KEY_SKIPPED, {})).length} SKIP · ${getLocalJson(KEY_ERRORS, []).length} ERROR</span></div>
+                <div id="m3cls-report-head"><span>📋 AUTO CLS SMART ${getModelLabel()} · SKIP / ERROR</span><span>${Object.keys(getLocalJson(KEY_SKIPPED, {})).length} SKIP · ${getLocalJson(KEY_ERRORS, []).length} ERROR</span></div>
                 <pre id="m3cls-report-text"></pre>
                 <div id="m3cls-report-actions"><button id="m3cls-copy-all">SAO CHÉP TOÀN BỘ</button><button id="m3cls-clear-errors">XÓA ERROR</button><button id="m3cls-close-report">ĐÓNG</button></div>
             </div>`;
@@ -591,50 +837,57 @@ Tổng ERROR: ${errors.length}`;
                 await navigator.clipboard.writeText(txt);
                 e.currentTarget.textContent = 'ĐÃ SAO CHÉP';
             } catch (_) {
-                alert('Trình duyệt không cho sao chép tự động. Hãy bôi đen nội dung trong cửa sổ báo cáo để copy.');
+                showBatchBubble('Không thể tự sao chép', 'Trình duyệt không cho phép sao chép tự động. Hãy bôi đen nội dung trong cửa sổ báo cáo để copy.', 'warn', 6500);
             }
         };
     }
 
     async function resetErrorList(reportOverlay) {
         if (isActive()) {
-            alert('Hãy bấm DỪNG trước khi xóa ERROR.');
+            showBatchBubble('Chưa thể xóa ERROR', 'Hãy bấm DỪNG trước khi xóa danh sách ERROR.', 'warn', 5000);
             return;
         }
-        if (!confirm('XÓA TOÀN BỘ DANH SÁCH ERROR?\n\nDanh sách SKIP và DONE không bị xóa.')) return;
+        const ok = await confirmBatchBubble('Xóa toàn bộ ERROR?', 'Danh sách SKIP và DONE không bị xóa.', { type: 'error', danger: true, okText: 'XÓA ERROR' });
+        if (!ok) return;
         localStorage.removeItem(KEY_ERRORS);
         const s = getStats();
         s.errors = 0;
         saveStats(s);
         reportOverlay?.remove();
-        alert('Đã xóa toàn bộ danh sách ERROR.');
+        showBatchBubble('Đã xóa ERROR', 'Danh sách ERROR đã được làm sạch.', 'ok', 3500);
     }
 
     async function resetSkippedList() {
         if (isActive()) {
-            alert('Hãy bấm DỪNG trước khi xóa danh sách SKIP.');
+            showBatchBubble('Chưa thể xóa SKIP', 'Hãy bấm DỪNG trước khi xóa danh sách SKIP.', 'warn', 5000);
             return;
         }
-        if (!confirm('XÓA TOÀN BỘ DANH SÁCH SKIP?\n\nCác ca này sẽ được tìm XN lại ở lần chạy kế tiếp. Danh sách DONE không bị xóa.')) return;
+        const ok = await confirmBatchBubble('Xóa toàn bộ SKIP?', 'Các ca này sẽ được tìm xét nghiệm lại ở lần chạy kế tiếp. Danh sách DONE không bị xóa.', { type: 'warn', danger: true, okText: 'XÓA SKIP' });
+        if (!ok) return;
         localStorage.removeItem(KEY_SKIPPED);
         const s = getStats();
         s.skippedNotFound = 0;
         s.skippedDuplicate = 0;
         s.skippedInvalid = 0;
         saveStats(s);
-        alert('Đã xóa danh sách SKIP. Có thể bấm BẮT ĐẦU để tìm lại các ca.');
+        showBatchBubble('Đã xóa SKIP', 'Có thể bấm CHẠY để tìm lại các ca đã bỏ qua.', 'ok', 4000);
     }
 
     async function startBatch() {
-        if (!isListPage()) {
-            alert('Hãy mở trang DANH SÁCH M3 và lọc "Chất lượng dữ liệu = Chưa có cận lâm sàng" trước khi bắt đầu.');
+        const model = getCurrentModel();
+        if (!model || !isListPage()) {
+            showBatchBubble('Chưa đúng trang', 'Hãy mở DANH SÁCH M3 hoặc M4 và lọc “Chất lượng dữ liệu = Chưa có cận lâm sàng” trước khi bắt đầu.', 'warn', 6500);
             return;
         }
+        sessionStorage.setItem(KEY_MODEL, model);
+
         const quality = getCurrentQualityFilterText();
         if (quality && !norm(quality).includes('chua co can lam sang')) {
-            if (!confirm(`Bộ lọc Chất lượng dữ liệu hiện là "${quality}".\n\nScript được thiết kế cho "Chưa có cận lâm sàng". Vẫn chạy?`)) return;
+            const proceed = await confirmBatchBubble(`Bộ lọc hiện là “${quality}”`, `AUTO CLS ${model} được thiết kế cho “Chưa có cận lâm sàng”. Ông vẫn muốn chạy?`, { type: 'warn', okText: 'VẪN CHẠY' });
+            if (!proceed) return;
         }
-        if (!confirm('BẮT ĐẦU AUTO SỬA CLS M3?\n\nScript sẽ TỰ LƯU dữ liệu trên Medinet:\n1) điền + lưu Cận lâm sàng\n2) mở + lưu Kết luận\n3) quay lại danh sách, chờ bảng tải xong rồi tiếp tục\n\nNên theo dõi kỹ vài ca đầu.')) return;
+        const confirmed = await confirmBatchBubble(`Bắt đầu AUTO CLS ${model}?`, `Script sẽ tự lưu trên Medinet:\n1) Điền + lưu Cận lâm sàng\n2) Mở + lưu Kết luận\n3) Quay lại danh sách và tiếp tục ca kế\n\nNên theo dõi kỹ vài ca đầu.`, { type: 'info', okText: `CHẠY ${model}` });
+        if (!confirmed) return;
 
         resetRunState();
         saveStats({
@@ -645,14 +898,16 @@ Tổng ERROR: ${errors.length}`;
         });
         setActive(true);
         setStage(STAGE.LIST);
+        showStatus(`AUTO CLS ${model} đã khởi động · đang đọc danh sách...`);
         queueRun();
     }
+
 
     async function stopBatch() {
         setActive(false);
         hideStatus();
         updatePanel();
-        alert('Đã dừng Auto CLS M3. Trạng thái ca hiện tại vẫn được giữ để kiểm tra thủ công.');
+        showBatchBubble(`Đã dừng AUTO CLS ${getModelLabel()}`, 'Trạng thái ca hiện tại vẫn được giữ để kiểm tra thủ công.', 'warn', 5500);
     }
 
     // =====================================================================
@@ -725,7 +980,7 @@ Tổng ERROR: ${errors.length}`;
             setActive(false);
             hideStatus();
             updatePanel();
-            alert(`⛔ AUTO ĐÃ DỪNG\n\nMedinet không tải xong ${context} sau 3 lần F5. Tiến trình ca hiện tại vẫn được giữ lại.`);
+            showBatchBubble('AUTO đã dừng', `Medinet không tải xong ${context} sau 3 lần F5. Tiến trình ca hiện tại vẫn được giữ lại.`, 'error', 9000);
             return false;
         }
 
@@ -754,12 +1009,32 @@ Tổng ERROR: ${errors.length}`;
     // =====================================================================
 
     function isListPage() {
-        const u = location.href;
-        const body = norm(document.body.innerText);
-        return u.includes('KSKDK_DanhSach_KSK_M13') ||
-               u.includes('KSKDK_DanhSach_KSK_M3') ||
-               (body.includes('du 18 - 59 tuoi') && body.includes('chat luong du lieu') && body.includes('dinh danh ca nhan'));
+        const u = location.href || '';
+        const body = norm(document.body.innerText || '');
+        const isM3 = MODEL_ROUTE.M3_LIST.some(x => u.includes(x));
+        const isM4 = MODEL_ROUTE.M4_LIST.some(x => u.includes(x));
+        if (isM3) {
+            sessionStorage.setItem(KEY_MODEL, 'M3');
+            return true;
+        }
+        if (isM4) {
+            sessionStorage.setItem(KEY_MODEL, 'M4');
+            return true;
+        }
+        // Dự phòng nếu portal thay route nhưng vẫn là đúng trang danh sách.
+        if (body.includes('chat luong du lieu') && body.includes('dinh danh ca nhan')) {
+            if (body.includes('nguoi cao tuoi') && body.includes('ngay kham')) {
+                sessionStorage.setItem(KEY_MODEL, 'M4');
+                return true;
+            }
+            if ((body.includes('18 - 59') || body.includes('18-59') || body.includes('du 18')) && body.includes('ngay kham')) {
+                sessionStorage.setItem(KEY_MODEL, 'M3');
+                return true;
+            }
+        }
+        return false;
     }
+
 
     function isClsPage() {
         const u = location.href;
@@ -767,6 +1042,8 @@ Tổng ERROR: ${errors.length}`;
         // Không dùng riêng chữ "Khám cận lâm sàng": chữ này luôn có trong
         // sidebar, kể cả khi đang ở Thông tin hành chính.
         return u.includes('KSKDK_Phieu_CanLamSang') ||
+               u.includes('KNCT_PhieuCLS_CanLamSang') ||
+               u.includes('KNCT_PhieuCLS') ||
                body.includes('ket qua xet nghiem mau') &&
                    (body.includes('so luong hc') || body.includes('huyet sac to')) ||
                body.includes('kham suc khoe dinh ky') && body.includes('so luong hc');
@@ -864,6 +1141,47 @@ Tổng ERROR: ${errors.length}`;
         });
     }
 
+    function getM4GearButtonInScope(scope) {
+        if (!scope) return null;
+
+        // Chỉ làm việc với DOM node thật. Một số nhánh M4 trước đây có thể truyền
+        // proxy/action object vào đây; Cốc Cốc sẽ lỗi khi spread querySelectorAll.
+        let root = scope;
+        if (typeof root.querySelectorAll !== 'function') {
+            root = root?.closest?.('tr,[role="row"]') || null;
+        }
+        if (!root || typeof root.querySelectorAll !== 'function') {
+            return null;
+        }
+
+        const iconSelector = 'i.fa.fa-cog, i[class~="fa-cog"], i[class*="fa-cog"]';
+
+        // Dùng Array.from thay cho spread NodeList để tránh lỗi iterable trên một số Chromium/Cốc Cốc.
+        const icons = Array.from(root.querySelectorAll(iconSelector))
+            .filter(isVisibleElement);
+
+        for (const icon of icons) {
+            const btn = icon.closest('button.dropdown-toggle, button[aria-haspopup="true"], button');
+            if (btn && isVisibleElement(btn)) return btn;
+        }
+
+        const buttons = Array.from(
+            root.querySelectorAll('button.dropdown-toggle, button[aria-haspopup="true"], button')
+        ).filter(isVisibleElement);
+
+        return buttons.find(btn => {
+            try {
+                return !!btn.querySelector(iconSelector);
+            } catch (_) {
+                return false;
+            }
+        }) || null;
+    }
+
+    function getM4ActionButtonFromCell(cell) {
+        return getM4GearButtonInScope(cell);
+    }
+
     function findPencilLinks() {
         const found = [];
         const seen = new Set();
@@ -873,8 +1191,6 @@ Tổng ERROR: ${errors.length}`;
             found.push(el);
         };
 
-        // Các phiên bản giao diện Medinet từng dùng fa-edit, fa-pencil,
-        // glyphicon-pencil, DevExtreme button hoặc chỉ gắn title/aria-label.
         const iconSelectors = [
             'i.fa-edit', 'i[class*="fa-edit"]',
             'i.fa-pen', 'i[class*="fa-pen"]',
@@ -883,8 +1199,20 @@ Tổng ERROR: ${errors.length}`;
             'svg[class*="pencil"]', 'svg[class*="edit"]'
         ].join(',');
 
+        const currentModel = getCurrentModel();
+
         for (const row of getListDataRows()) {
             const cells = [...row.querySelectorAll(':scope > td, :scope > [role="gridcell"]')];
+
+            // M4: KHÔNG tìm cây viết toàn dòng trước, vì "Chỉnh sửa" chỉ xuất hiện
+            // sau khi mở dropdown. Luôn lấy đúng nút bánh răng ở cột Xử lý.
+            if (currentModel === 'M4') {
+                // M4 khác M3: chỉ cần dòng dữ liệu đã render là coi như có action.
+                // Nếu đọc được nút bánh răng thì dùng nút; nếu chưa đọc được thì
+                // dùng chính ô Xử lý làm proxy, openCaseFromListAction sẽ tìm lại.
+                add(getM4ActionButtonFromCell(cells[1]) || cells[1]);
+                continue;
+            }
 
             let action = row.querySelector(
                 'a[title*="Sửa" i],button[title*="Sửa" i],' +
@@ -898,10 +1226,10 @@ Tổng ERROR: ${errors.length}`;
                 action = icon?.closest('a,button,[role="button"]') || icon;
             }
 
-            // Fallback ổn định nhất cho bảng trong ảnh: cột 0 = STT,
-            // cột 1 = XỬ LÝ. Chỉ dùng trong một dòng dữ liệu đủ >= 8 cột.
             if (!action && cells[1]) {
-                action = cells[1].querySelector('a,button,[role="button"],.dx-button,i,svg');
+                action = cells[1].querySelector(
+                    'a,button,[role="button"],.dx-button,i,svg'
+                );
             }
 
             add(action);
@@ -909,11 +1237,227 @@ Tổng ERROR: ${errors.length}`;
         return found;
     }
 
-    function parseCaseFromPencil(link) {
-        const row = link.closest('tr') || link.closest('[role="row"]');
+    function clickOnce(el) {
+        if (!el) return false;
+        try {
+            el.focus?.({ preventScroll: true });
+        } catch (_) {}
+        try {
+            el.click();
+            return true;
+        } catch (_) {
+            try {
+                el.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    view: window
+                }));
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+    }
+
+    function getVisibleM4EditItems() {
+        // Menu ngx-bootstrap được append container="body" nên nằm ngoài <tr>.
+        // Bám vào icon fa-pen + text Chỉnh sửa, không phụ thuộc href tuyệt đối.
+        return [...document.querySelectorAll('a,button,[role="menuitem"]')]
+            .filter(isVisibleElement)
+            .filter(el => {
+                const hasPen = !!el.querySelector('i.fas.fa-pen, i.fa.fa-pen, i[class~="fa-pen"], i[class*="fa-pen"]');
+                const t = norm(el.textContent || '');
+                return hasPen && t.includes('chinh sua');
+            });
+    }
+
+    function pickNearestM4EditItem(items, action) {
+        if (!items?.length) return null;
+        const ar = action?.getBoundingClientRect?.();
+
+        const normalized = items.map(el =>
+            el.closest('a,button,[role="menuitem"],[role="button"],.dropdown-item,.dx-menu-item,li') || el
+        );
+
+        const unique = [...new Set(normalized)].filter(isVisibleElement);
+        if (!ar || !unique.length) return unique[0] || null;
+
+        return unique.sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            const da = Math.abs(ra.top - ar.bottom) + Math.abs(ra.left - ar.left) * 0.35;
+            const db = Math.abs(rb.top - ar.bottom) + Math.abs(rb.left - ar.left) * 0.35;
+            return da - db;
+        })[0] || null;
+    }
+
+    async function openCaseFromListAction(action, c) {
+        const model = c?.model || getCurrentModel();
+
+        if (model !== 'M4') {
+            return robustClick(action);
+        }
+
+        // Không tin vào index cột Xử lý của M4. Tìm lại đúng dòng bằng CCCD/Họ tên,
+        // rồi quét toàn bộ dòng để lấy button chứa icon fa-cog thực tế.
+        let row = findM4RowForCase(c) || action?.closest?.('tr,[role="row"]') || null;
+        if (row && typeof row.querySelectorAll !== 'function') row = null;
+
+        let gearButton = getM4GearButtonForCase(c, row);
+
+        // Fallback cuối: action bản thân đã là button/ở trong button bánh răng.
+        if (!gearButton && action) {
+            const direct = action.matches?.('button') ? action : action.closest?.('button');
+            if (direct && isVisibleElement(direct)) gearButton = direct;
+        }
+
+        if (!gearButton) {
+            const rowText = norm(row?.textContent || '').slice(0, 180);
+            throw new Error(
+                `M4: không tìm được nút bánh răng của ${c?.hoTen || 'ca hiện tại'}. ` +
+                `Row="${rowText || 'không đọc được'}" · gearVisible=${getVisibleM4GearButtons().length}`
+            );
+        }
+
+        showStatus(`M4 · mở bánh răng: ${c?.hoTen || ''}`);
+
+        // Ngx-bootstrap dropdown là toggle thật sự: chỉ gọi native click đúng 1 lần.
+        try {
+            gearButton.focus?.({ preventScroll: true });
+        } catch (_) {}
+        gearButton.click();
+
+        // Menu được container="body" nên item có thể nằm ngoài row.
+        const editItem = await waitFor(() => {
+            const items = getVisibleM4EditItems();
+            if (!items.length) return null;
+            return pickNearestM4EditItem(items, gearButton) || items[0];
+        }, 6000, 80);
+
+        if (!editItem) {
+            throw new Error(
+                `M4: đã bấm đúng bánh răng nhưng không thấy mục ` +
+                `a[href="javascript:;"] > i.fas.fa-pen + “Chỉnh sửa” của ${c?.hoTen || 'ca hiện tại'}.`
+            );
+        }
+
+        showStatus(`M4 · chọn Chỉnh sửa: ${c?.hoTen || ''}`);
+
+        const opened = await activateM4EditAndWait(editItem, c);
+        if (!opened) {
+            throw new Error(`M4: đã bấm “Chỉnh sửa” nhưng Medinet vẫn ở trang danh sách của ${c?.hoTen || 'ca hiện tại'}.`);
+        }
+
+        return true;
+    }
+
+
+    function isM4ListUrl() {
+        const u = location.href || '';
+        return MODEL_ROUTE.M4_LIST.some(x => u.includes(x));
+    }
+
+    function isM4DetailContext() {
+        const u = location.href || '';
+        if (MODEL_ROUTE.M4_DETAIL.some(x => u.includes(x))) return true;
+        if (isM4ListUrl()) return false;
+        const body = norm(document.body?.innerText || '');
+        return (
+            body.includes('thong tin hanh chinh') &&
+            body.includes('luu thay doi') &&
+            (body.includes('tien su') || body.includes('kham can lam sang'))
+        );
+    }
+
+    function sameCaseIdentity(a, b) {
+        if (!a || !b) return false;
+        const cccdA = String(a.cccd || '').replace(/\s/g, '');
+        const cccdB = String(b.cccd || '').replace(/\s/g, '');
+        if (cccdA && cccdB) return cccdA === cccdB;
+        return norm(a.hoTen) === norm(b.hoTen) && sameDate(a.ngayKham, b.ngayKham);
+    }
+
+    function findM4RowForCase(c) {
+        const found = getM4RowCandidates().find(x => sameCaseIdentity(x.c, c));
+        return found?.row || null;
+    }
+
+    function getVisibleM4GearButtons() {
+        const buttons = Array.from(document.querySelectorAll(
+            'button.dropdown-toggle.btn-kcl-success, ' +
+            'button.dropdown-toggle[aria-haspopup="true"], ' +
+            'button.dropdown-toggle'
+        )).filter(isVisibleElement);
+
+        return buttons.filter(btn => {
+            try {
+                return !!btn.querySelector('i.fa-cog, i[class~="fa-cog"], i[class*="fa-cog"]');
+            } catch (_) {
+                return false;
+            }
+        });
+    }
+
+    function getM4GearButtonForCase(c, preferredRow = null) {
+        // 1) Ưu tiên đúng row đã match theo CCCD/Họ tên.
+        const row = preferredRow || findM4RowForCase(c);
+        if (row) {
+            const direct = getM4GearButtonInScope(row);
+            if (direct) return direct;
+
+            // DOM inspect thực tế M4: button.dropdown-toggle.btn-kcl-success.
+            const btn = row.querySelector?.('button.dropdown-toggle.btn-kcl-success, button.dropdown-toggle');
+            if (btn && isVisibleElement(btn)) return btn;
+        }
+
+        // 2) Quét toàn bộ gear visible rồi match row của từng button bằng CCCD.
+        const allGears = getVisibleM4GearButtons();
+        for (const btn of allGears) {
+            const r = btn.closest?.('tr,[role="row"]');
+            const parsed = r ? parseCaseFromRow(r) : null;
+            if (parsed && sameCaseIdentity(parsed, c)) return btn;
+        }
+
+        // 3) Fallback theo thứ tự row <-> gear button nếu framework tách DOM action khỏi row.
+        const candidates = getM4RowCandidates();
+        const idx = candidates.findIndex(x => sameCaseIdentity(x.c, c));
+        if (idx >= 0 && allGears[idx]) return allGears[idx];
+
+        return null;
+    }
+
+    async function waitUntilM4Detail(timeout = 12000) {
+        return await waitFor(() => isM4DetailContext() ? true : null, timeout, 120);
+    }
+
+    async function activateM4EditAndWait(editItem, c) {
+        if (!editItem) return false;
+
+        const anchor = editItem.matches?.('a')
+            ? editItem
+            : (editItem.querySelector?.('a') || editItem.closest?.('a') || editItem);
+
+        showStatus(`M4 · mở hồ sơ: ${c?.hoTen || ''}`);
+
+        // Lần 1: native click đúng cơ chế Angular/ngx-bootstrap.
+        clickOnce(anchor);
+        let opened = await waitUntilM4Detail(1800);
+        if (opened) return true;
+
+        // Một số build Angular không nhận HTMLElement.click() khi dropdown vừa render.
+        // Fallback: bắn chuỗi pointer/mouse đúng 1 lần rồi chờ route/detail thật sự.
+        showStatus(`M4 · đang kích hoạt Chỉnh sửa lần 2: ${c?.hoTen || ''}`);
+        robustClick(anchor);
+        opened = await waitUntilM4Detail(6500);
+        return !!opened;
+    }
+
+    function parseCaseFromRow(row) {
         if (!row) return null;
-        const cells = [...row.querySelectorAll('td, [role="gridcell"]')];
+        const cells = [...row.querySelectorAll(':scope > td, :scope > [role="gridcell"]')];
         if (cells.length < 8) return null;
+
         const hm = getHeaderMap(row);
         const idx = {
             name: hm.name ?? 3,
@@ -922,6 +1466,7 @@ Tổng ERROR: ${errors.length}`;
             sex: hm.sex ?? 6,
             examDate: hm.examDate ?? 8
         };
+
         const readCase = indexes => ({
             pageNumber: getCurrentPageNumber(),
             rowStt: (cells[0]?.textContent || '').trim(),
@@ -929,15 +1474,11 @@ Tổng ERROR: ${errors.length}`;
             cccd: (cells[indexes.cccd]?.textContent || '').replace(/\s/g, '').trim(),
             ngaySinh: (cells[indexes.dob]?.textContent || '').trim(),
             gioiTinh: (cells[indexes.sex]?.textContent || '').trim(),
-            ngayKham: (cells[indexes.examDate]?.textContent || '').trim()
+            ngayKham: (cells[indexes.examDate]?.textContent || '').trim(),
+            model: getCurrentModel()
         });
 
         let c = readCase(idx);
-
-        // Layout cố định đang hiển thị trong danh sách M3:
-        // 0 STT, 1 Xử lý, 2 Đơn vị, 3 Họ tên, 4 CCCD,
-        // 5 Ngày sinh, 6 Giới tính, 7 Mã phiếu, 8 Ngày khám.
-        // Nếu header động bị lệch, quay về đúng layout này.
         if (!c.hoTen || !c.ngayKham || !/\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/.test(c.ngayKham)) {
             c = readCase({ name: 3, cccd: 4, dob: 5, sex: 6, examDate: 8 });
         }
@@ -945,7 +1486,34 @@ Tổng ERROR: ${errors.length}`;
         return c;
     }
 
+    function getM4RowCandidates() {
+        return getListDataRows()
+            .map(row => {
+                const c = parseCaseFromRow(row);
+                if (!c) return null;
+                const cells = [...row.querySelectorAll(':scope > td, :scope > [role="gridcell"]')];
+                const actionCell = cells[1] || null;
+                return actionCell ? { row, actionCell, c } : null;
+            })
+            .filter(Boolean);
+    }
+
+    function parseCaseFromPencil(link) {
+        const row = link?.closest?.('tr,[role="row"]');
+        return parseCaseFromRow(row);
+    }
+
     function getVisibleAvailableCase() {
+        const model = getCurrentModel();
+
+        if (model === 'M4') {
+            for (const item of getM4RowCandidates()) {
+                if (isDone(item.c) || isSkipped(item.c)) continue;
+                return { link: item.actionCell, c: item.c, row: item.row };
+            }
+            return null;
+        }
+
         for (const link of findPencilLinks()) {
             const c = parseCaseFromPencil(link);
             if (!c) continue;
@@ -988,15 +1556,17 @@ Tổng ERROR: ${errors.length}`;
             }
 
             const count = getResultCount();
+            const model = getCurrentModel();
             const pencils = findPencilLinks().length;
-            const valid = count === 0 || (count > 0 && pencils > 0);
+            const rows = getListDataRows().length;
+            const valid = count === 0 || (count > 0 && (model === 'M4' ? getM4RowCandidates().length > 0 : pencils > 0));
             if (!valid) {
                 signature = '';
                 stableSince = 0;
                 return false;
             }
 
-            const nextSignature = `${count}|${pencils}`;
+            const nextSignature = `${count}|${model === 'M4' ? rows : pencils}`;
             if (nextSignature !== signature) {
                 signature = nextSignature;
                 stableSince = Date.now();
@@ -1118,8 +1688,13 @@ Tổng ERROR: ${errors.length}`;
     const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 
     function listSignature() {
-        const first = findPencilLinks()[0];
-        const c = first ? parseCaseFromPencil(first) : null;
+        let c = null;
+        if (getCurrentModel() === 'M4') {
+            c = getM4RowCandidates()[0]?.c || null;
+        } else {
+            const first = findPencilLinks()[0];
+            c = first ? parseCaseFromPencil(first) : null;
+        }
         return `${getResultCount() ?? '?'}|${c?.cccd || ''}|${c?.hoTen || ''}`;
     }
 
@@ -1868,7 +2443,7 @@ Tổng ERROR: ${errors.length}`;
         showStatus(`Đang ${label}...`);
 
         // Cùng fastClick của Auto KL M2, nhưng giới hạn vào nút ĐANG HIỂN THỊ.
-        // SPA M3 giữ DOM trang CLS cũ khi đang chuyển sang Kết luận.
+        // SPA Medinet có thể giữ DOM trang CLS cũ khi đang chuyển sang Kết luận.
         const btn = await waitFor(
             () => findVisibleButtonByText('lưu thay đổi'),
             20000,
@@ -2022,22 +2597,20 @@ Tổng ERROR: ${errors.length}`;
     // =====================================================================
 
     async function handleList() {
-        showStatus('Đang chờ Medinet tải xong danh sách...');
+        const modelNow = getCurrentModel();
+        showStatus(`Đang chờ Medinet tải xong danh sách ${modelNow || ''}...`);
+
         const pageReady = await waitForPageReadyOrReload(
             30000,
             'trang danh sách',
             createStableListReadyCheck()
         );
-        if (!pageReady) {
-            return;
-        }
+        if (!pageReady) return;
 
         let resultCount = getResultCount();
-
         showStatus(`Danh sách thiếu CLS${resultCount !== null ? `: ${resultCount} kết quả` : ''} · Trang ${getCurrentPageNumber()}`);
 
         if (resultCount === 0) {
-            // Chốt lần cuối ngay trước khi kết thúc để không dính bộ đếm 0 tạm.
             if (isListLoading()) {
                 queueRun(500);
                 return;
@@ -2046,11 +2619,58 @@ Tổng ERROR: ${errors.length}`;
             return;
         }
 
-        // Dòng bảng được Angular/DevExtreme render sau phần khung trang.
-        // Nếu bộ đếm > 0, tuyệt đối không kết luận "hết ca" trước khi chờ dòng/nút xử lý.
+        // M4 dùng trực tiếp dòng dữ liệu, tuyệt đối không phụ thuộc selector cây viết/bánh răng của M3.
+        if (modelNow === 'M4') {
+            let rows = getM4RowCandidates();
+            if (resultCount > 0 && rows.length === 0) {
+                showStatus(`M4 · Có ${resultCount} kết quả · đang chờ các dòng bệnh nhân render...`);
+                await waitFor(() => getM4RowCandidates().length > 0 || getResultCount() === 0, 12000, 180);
+                resultCount = getResultCount();
+                rows = getM4RowCandidates();
+            }
+
+            if (resultCount === 0) {
+                finishBatch('Filter đã còn 0 kết quả.');
+                return;
+            }
+
+            if (resultCount > 0 && rows.length === 0) {
+                throw new Error(`M4: bảng báo ${resultCount} kết quả nhưng chưa đọc được dòng bệnh nhân.`);
+            }
+
+            const found = rows.find(x => !isDone(x.c) && !isSkipped(x.c)) || null;
+            if (found) {
+                found.c.startedAt = Date.now();
+                setCase(found.c);
+                setStage(STAGE.OPENING_CASE);
+                showStatus(`M4 · mở ca: ${found.c.hoTen} · ${found.c.cccd}`);
+
+                if (!await openCaseFromListAction(found.actionCell, found.c)) {
+                    throw new Error(`M4: không mở được hồ sơ của ${found.c.hoTen}.`);
+                }
+
+                setStage(STAGE.OPEN_CLS);
+                queueRun();
+                return;
+            }
+
+            if (await goNextPageIfPossible()) {
+                queueRun();
+                return;
+            }
+
+            finishBatch('Đã quét hết các trang M4; chỉ còn ca đã SKIP/DONE hoặc không còn ca thiếu CLS.');
+            return;
+        }
+
+        // M3 giữ nguyên logic nút cây viết.
         if (resultCount > 0 && findPencilLinks().length === 0) {
             showStatus(`Có ${resultCount} kết quả · đang chờ bảng và nút Xử lý hiển thị...`);
-            await waitFor(() => findPencilLinks().length > 0 || getResultCount() === 0, 20000, 250);
+            await waitFor(
+                () => findPencilLinks().length > 0 || getResultCount() === 0,
+                12000,
+                180
+            );
             resultCount = getResultCount();
         }
 
@@ -2059,12 +2679,13 @@ Tổng ERROR: ${errors.length}`;
             .map(link => ({ link, c: parseCaseFromPencil(link) }))
             .filter(x => x.c);
         const found = parsedCases.find(candidate => !isDone(candidate.c) && !isSkipped(candidate.c)) || null;
+
         if (found) {
             found.c.startedAt = Date.now();
             setCase(found.c);
             setStage(STAGE.OPENING_CASE);
-            showStatus(`Mở ca: ${found.c.hoTen} · ${found.c.cccd}`);
-            if (!robustClick(found.link)) {
+            showStatus(`Mở ca M3: ${found.c.hoTen} · ${found.c.cccd}`);
+            if (!await openCaseFromListAction(found.link, found.c)) {
                 throw new Error(`Không kích hoạt được nút Xử lý của ${found.c.hoTen}.`);
             }
             await sleep(500);
@@ -2077,24 +2698,64 @@ Tổng ERROR: ${errors.length}`;
             return;
         }
 
-        // Có kết quả nhưng không đọc được bất kỳ nút Xử lý nào là lỗi selector/render,
-        // không được báo nhầm là đã quét hết.
-        if (resultCount > 0 && findPencilLinks().length === 0) {
-            throw new Error(`Bảng báo ${resultCount} kết quả nhưng không đọc được nút ở cột Xử lý.`);
+        if (resultCount > 0 && pencilLinks.length === 0) {
+            throw new Error(`M3: bảng báo ${resultCount} kết quả nhưng không đọc được nút cây viết ở cột Xử lý.`);
         }
-
         if (resultCount > 0 && pencilLinks.length > 0 && parsedCases.length === 0) {
-            throw new Error(`Đã thấy ${pencilLinks.length} nút Xử lý nhưng không đọc được Họ tên/Ngày khám của dòng.`);
+            throw new Error(`M3: đã thấy ${pencilLinks.length} nút Xử lý nhưng không đọc được Họ tên/Ngày khám của dòng.`);
         }
 
-        // Không còn ca khả dụng ở trang hiện tại: chuyển trang.
         if (await goNextPageIfPossible()) {
             queueRun();
             return;
         }
 
-        // Đến trang cuối, không còn ca ngoài SKIP/DONE.
         finishBatch('Đã quét hết các trang; chỉ còn ca đã SKIP hoặc không còn ca thiếu CLS.');
+    }
+
+
+    async function handleOpeningCase() {
+        const c = getCase();
+        if (!c) {
+            setStage(STAGE.LIST);
+            queueRun();
+            return;
+        }
+
+        // Nếu hồ sơ đã mở thật sự thì mới được chuyển sang bước mở CLS.
+        if (!isListPage() || (c.model === 'M4' && isM4DetailContext())) {
+            setStage(STAGE.OPEN_CLS);
+            queueRun();
+            return;
+        }
+
+        if (c.model === 'M4') {
+            showStatus(`M4 · mở lại hồ sơ: ${c.hoTen} · ${c.cccd || ''}`);
+            const found = findM4RowForCase(c);
+            if (!found) {
+                throw new Error(`M4: không tìm lại được dòng của ${c.hoTen} trên danh sách.`);
+            }
+
+            await openCaseFromListAction(found.actionCell, c);
+            if (!isM4DetailContext()) {
+                throw new Error(`M4: thao tác Chỉnh sửa xong nhưng chưa vào được hồ sơ ${c.hoTen}.`);
+            }
+
+            setStage(STAGE.OPEN_CLS);
+            queueRun();
+            return;
+        }
+
+        // M3: nếu vẫn còn ở danh sách thì tìm lại đúng ca và bấm cây viết.
+        const match = findPencilLinks()
+            .map(link => ({ link, c: parseCaseFromPencil(link) }))
+            .find(x => x.c && sameCaseIdentity(x.c, c));
+        if (!match) throw new Error(`M3: không tìm lại được nút Xử lý của ${c.hoTen}.`);
+        robustClick(match.link);
+        const leftList = await waitFor(() => !isListPage(), 12000, 180);
+        if (!leftList) throw new Error(`M3: bấm Xử lý nhưng chưa mở hồ sơ ${c.hoTen}.`);
+        setStage(STAGE.OPEN_CLS);
+        queueRun();
     }
 
     async function handleOpenCls() {
@@ -2211,7 +2872,7 @@ Tổng ERROR: ${errors.length}`;
         }
         showStatus('Đã lưu CLS · đang mở Kết luận...');
 
-        // ID KSKD18_KetLuanKham thuộc M2; M3 có thể dùng ID khác.
+        // ID Kết luận thay đổi giữa các mẫu; dò theo text để dùng chung M3/M4.
         // Dùng lại cơ chế dò đúng mục "Kết luận" đã mở được trang ở các bản trước.
         await clickSidebar(['Kết luận', 'Kết luận khám'], isConclusionPage, 'Kết luận');
         setStage(STAGE.SAVE_CONCLUSION);
@@ -2306,21 +2967,14 @@ Tổng ERROR: ${errors.length}`;
         const s = getStats();
         const processed = Number(s.processed || 0);
         const success = processed ? ((Number(s.done || 0) / processed) * 100).toFixed(1) : '0.0';
-        alert(`✅ AUTO SỬA CLS M3 KẾT THÚC
-
-${message}
-
-Đã xử lý: ${processed}
-Hoàn tất: ${s.done || 0} (${success}%)
-Bỏ qua: ${s.skipped || 0}
-- Không tìm thấy XN: ${s.skippedNotFound || 0}
-- Trùng kết quả: ${s.skippedDuplicate || 0}
-- Không hợp lệ/lỗi: ${s.skippedInvalid || 0}
-Retry: ${s.retries || 0}
-Lỗi ghi nhận: ${s.errors || 0}
-
-Bấm 📋 để xem chi tiết.`);
+        showBatchBubble(
+            `AUTO CLS ${getModelLabel()} kết thúc`,
+            `${message}\n\nĐã xử lý: ${processed}\nHoàn tất: ${s.done || 0} (${success}%)\nBỏ qua: ${s.skipped || 0}\n• Không tìm thấy XN: ${s.skippedNotFound || 0}\n• Trùng kết quả: ${s.skippedDuplicate || 0}\n• Không hợp lệ/lỗi: ${s.skippedInvalid || 0}\nRetry: ${s.retries || 0}\nLỗi ghi nhận: ${s.errors || 0}\n\nBấm 📋 để xem chi tiết.`,
+            (s.errors || s.skipped) ? 'warn' : 'ok',
+            10000
+        );
     }
+
 
     let busy = false;
 
@@ -2336,7 +2990,8 @@ Bấm 📋 để xem chi tiết.`);
             const stage = getStage();
             log('RUN stage:', stage, 'URL:', location.href);
             if (stage === STAGE.LIST) await handleList();
-            else if (stage === STAGE.OPENING_CASE || stage === STAGE.OPEN_CLS) await handleOpenCls();
+            else if (stage === STAGE.OPENING_CASE) await handleOpeningCase();
+            else if (stage === STAGE.OPEN_CLS) await handleOpenCls();
             else if (stage === STAGE.FILL_CLS) await handleFillCls();
             else if (stage === STAGE.SAVE_CLS) await handleSaveCls();
             else if (stage === STAGE.WAIT_CLS_RELOAD) await handleWaitClsReload();
@@ -2367,21 +3022,23 @@ Bấm 📋 để xem chi tiết.`);
     // =====================================================================
 
     function installNavigationWatcher() {
-        if (window.__m3ClsBatchNavInstalled) return;
-        window.__m3ClsBatchNavInstalled = true;
+        if (window.__m34ClsBatchNavInstalled) return;
+        window.__m34ClsBatchNavInstalled = true;
 
         const fire = () => setTimeout(() => runSafely(), 500);
         const p = history.pushState, r = history.replaceState;
-        history.pushState = function (...args) { const out = p.apply(this, args); window.dispatchEvent(new Event('m3cls-locationchange')); return out; };
-        history.replaceState = function (...args) { const out = r.apply(this, args); window.dispatchEvent(new Event('m3cls-locationchange')); return out; };
-        window.addEventListener('popstate', () => window.dispatchEvent(new Event('m3cls-locationchange')));
-        window.addEventListener('m3cls-locationchange', fire);
+        history.pushState = function (...args) { const out = p.apply(this, args); window.dispatchEvent(new Event('m34cls-locationchange')); return out; };
+        history.replaceState = function (...args) { const out = r.apply(this, args); window.dispatchEvent(new Event('m34cls-locationchange')); return out; };
+        window.addEventListener('popstate', () => window.dispatchEvent(new Event('m34cls-locationchange')));
+        window.addEventListener('m34cls-locationchange', fire);
 
         let last = location.href;
         setInterval(() => {
             if (location.href !== last) {
                 last = location.href;
                 sessionStorage.setItem(KEY_LAST_URL, last);
+                rememberDetectedModel();
+                updatePanel();
                 if (isActive()) fire();
             }
         }, 500);
@@ -2401,6 +3058,7 @@ Bấm 📋 để xem chi tiết.`);
     // =====================================================================
 
     async function init() {
+        rememberDetectedModel();
         installNetworkTracker();
         ensurePanel();
         installNavigationWatcher();
@@ -2416,7 +3074,7 @@ Bấm 📋 để xem chi tiết.`);
             await sleep(700);
             queueRun();
         }
-        log('READY v1.5.0 SINGLE-TAB STATS+ERRORS');
+        log('READY v2.0.6 SMART M3/M4 · SINGLE TAB');
     }
 
     init();
