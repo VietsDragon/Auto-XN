@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.0.11
+// @version      2.0.12
 // @description  Tự nhận diện M3/M4: tìm XN theo Họ tên + ngày XN, điền/lưu CLS, mở/lưu Kết luận, quay lại danh sách và tiếp tục batch.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
@@ -1595,77 +1595,330 @@ Tổng ERROR: ${errors.length}`;
         return null;
     }
 
+    // =====================================================================
+    // PAGER ROBUST - v2.0.12
+    // =====================================================================
+    // M3/M4 đều dùng DevExtreme nhưng DOM pager có thể khác nhau theo route/theme.
+    // Tuyệt đối không kết luận hết batch chỉ vì không bắt được một selector "Next".
+
+    function getPagerContainers() {
+        const selectors = [
+            '.dx-datagrid-pager',
+            '.dx-pager',
+            '.dx-pagination',
+            '.dx-pages',
+            '[class*="pager"]',
+            '[class*="pagination"]'
+        ].join(',');
+
+        const all = [...document.querySelectorAll(selectors)]
+            .filter(el => el && el.isConnected);
+
+        return [...new Set(all)];
+    }
+
+    function pagerNodeDisabled(el) {
+        if (!el) return true;
+        let p = el;
+        for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+            if (p.disabled === true) return true;
+            if (p.getAttribute?.('aria-disabled') === 'true') return true;
+            const cls = p.classList;
+            if (cls?.contains('dx-state-disabled') || cls?.contains('disabled')) return true;
+        }
+        return false;
+    }
+
+    function pagerNodeSelected(el) {
+        let p = el;
+        for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+            if (p.getAttribute?.('aria-current') === 'page') return true;
+            if (p.getAttribute?.('aria-selected') === 'true') return true;
+            const cls = p.classList;
+            if (
+                cls?.contains('dx-selection') ||
+                cls?.contains('dx-page-selected') ||
+                cls?.contains('selected') ||
+                cls?.contains('active')
+            ) return true;
+        }
+        return false;
+    }
+
+    function getPagerNumberNodes() {
+        const out = [];
+        const seen = new Set();
+
+        for (const root of getPagerContainers()) {
+            const nodes = [root, ...root.querySelectorAll('a,button,div,span')];
+            for (const el of nodes) {
+                if (!el || seen.has(el)) continue;
+                const txt = (el.textContent || '').trim();
+                if (!/^\d{1,4}$/.test(txt)) continue;
+
+                const n = Number(txt);
+                if (!Number.isFinite(n) || n < 1) continue;
+
+                seen.add(el);
+                out.push({ el, n, selected: pagerNodeSelected(el) });
+            }
+        }
+
+        return out;
+    }
+
     function getCurrentPageNumber() {
+        // DOM pager phản ánh trang người dùng đang thấy; ưu tiên trước grid instance
+        // vì M4 đôi lúc instance cũ vẫn tồn tại trong lúc Angular thay grid.
+        const explicit = [
+            ...document.querySelectorAll(
+                '.dx-page.dx-selection, .dx-page[aria-current="page"], .dx-page-selected, ' +
+                '.pagination .active, [class*="pager"] [aria-current="page"]'
+            )
+        ];
+
+        for (const el of explicit) {
+            const n = parseInt((el.textContent || '').trim(), 10);
+            if (Number.isFinite(n) && n >= 1) return n;
+        }
+
+        const selected = getPagerNumberNodes().find(x => x.selected);
+        if (selected?.n) return selected.n;
+
         const grid = getListGridInstance();
         try {
             const index = Number(grid?.pageIndex?.());
-            if (Number.isFinite(index)) return index + 1;
+            if (Number.isFinite(index) && index >= 0) return index + 1;
         } catch (_) {}
-        const selected = document.querySelector('.dx-page.dx-selection, .dx-page[aria-current="page"], .dx-page-selected');
-        const n = parseInt((selected?.textContent || '').trim(), 10);
-        return Number.isFinite(n) ? n : 1;
+
+        return 1;
     }
 
-    function findPageNumberButton(pageNumber) {
-        return [...document.querySelectorAll('.dx-pager .dx-page, .dx-pages .dx-page')]
-            .find(el => parseInt((el.textContent || '').trim(), 10) === pageNumber) || null;
+    function getPageSize() {
+        const grid = getListGridInstance();
+        try {
+            const n = Number(grid?.pageSize?.());
+            if (Number.isFinite(n) && n >= 5 && n <= 1000) return n;
+        } catch (_) {}
+
+        const selectors = [
+            '.dx-page-sizes .dx-page.dx-selection',
+            '.dx-page-sizes .dx-selection',
+            '.dx-page-size.dx-selection',
+            '.dx-pager .dx-page-sizes [aria-selected="true"]'
+        ];
+
+        for (const sel of selectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                const n = parseInt((el.textContent || '').trim(), 10);
+                if (Number.isFinite(n) && n >= 5 && n <= 1000) return n;
+            }
+        }
+
+        // Medinet hiện thường hiển thị 50 dòng/trang.
+        // Fallback này chỉ dùng để CHẶN finish sai, không dùng để chọn dữ liệu.
+        return 50;
+    }
+
+    function getRenderedPageSignature() {
+        const model = getCurrentModel();
+        let cases = [];
+
+        if (model === 'M4') {
+            cases = getM4RowCandidates().slice(0, 6).map(x => x.c);
+        } else {
+            cases = findPencilLinks()
+                .slice(0, 6)
+                .map(link => parseCaseFromPencil(link))
+                .filter(Boolean);
+        }
+
+        const keys = cases.map(c => `${c?.cccd || ''}|${c?.hoTen || ''}|${c?.ngayKham || ''}`);
+        return `${model || '?'}|${getCurrentPageNumber()}|${getResultCount() ?? '?'}|${keys.join('||')}`;
     }
 
     function findNextPageButton() {
-        const candidates = [
-            document.querySelector('.dx-next-button'),
-            document.querySelector('[aria-label="Next page"]'),
-            document.querySelector('[aria-label*="Next"]'),
-            document.querySelector('.dx-pager .dx-navigate-button.dx-next-button')
-        ].filter(Boolean);
-        for (const b of candidates) {
-            const disabled = b.classList.contains('dx-state-disabled') || b.getAttribute('aria-disabled') === 'true';
-            if (!disabled) return b;
+        const localSelectors = [
+            '.dx-next-button',
+            '.dx-navigate-button.dx-next-button',
+            '[aria-label*="next" i]',
+            '[title*="next" i]',
+            '[aria-label*="trang sau" i]',
+            '[title*="trang sau" i]',
+            '[aria-label*="tiếp" i]',
+            '[title*="tiếp" i]',
+            '.dx-icon-chevronright',
+            '.dx-icon-arrowright'
+        ].join(',');
+
+        const candidates = [];
+
+        for (const root of getPagerContainers()) {
+            candidates.push(...root.querySelectorAll(localSelectors));
+
+            candidates.push(
+                ...[...root.querySelectorAll('a,button,div,span')].filter(el => {
+                    const t = (el.textContent || '').trim();
+                    return t === '>' || t === '›' || t === '»';
+                })
+            );
         }
+
+        // Fallback toàn trang khi pager không nằm trong wrapper chuẩn.
+        candidates.push(
+            ...document.querySelectorAll(
+                '.dx-next-button,' +
+                '[aria-label*="Next" i],[title*="Next" i],' +
+                '[aria-label*="trang sau" i],[title*="trang sau" i]'
+            )
+        );
+
+        const seen = new Set();
+        for (let el of candidates) {
+            el = el?.closest?.('button,a,[role="button"],.dx-page,.dx-navigate-button') || el;
+            if (!el || seen.has(el)) continue;
+            seen.add(el);
+            if (!pagerNodeDisabled(el)) return el;
+        }
+
         return null;
     }
 
-    async function goNextPageIfPossible() {
-        const oldPage = getCurrentPageNumber();
-        const targetPage = oldPage + 1;
-        const oldSignature = listSignature();
+    function findNumericPageButton(targetPage) {
+        const items = getPagerNumberNodes()
+            .filter(x => x.n === targetPage && !x.selected);
+
+        for (const item of items) {
+            const el =
+                item.el.closest?.('button,a,[role="button"],.dx-page') ||
+                item.el;
+
+            if (!pagerNodeDisabled(el)) return el;
+        }
+
+        return null;
+    }
+
+    function pagerSaysThereMustBeAnotherPage(totalCount, currentPage) {
         const grid = getListGridInstance();
 
+        // Nguồn mạnh nhất: pageCount thật của DevExtreme.
         try {
             const pageCount = Number(grid?.pageCount?.());
-            if (Number.isFinite(pageCount) && targetPage > pageCount) return false;
+            if (Number.isFinite(pageCount) && pageCount > currentPage) return true;
         } catch (_) {}
 
-        showStatus(`Trang ${oldPage}: toàn bộ ca đang thấy đã DONE/SKIP → sang trang ${targetPage}...`);
-        let triggered = false;
-
-        if (grid?.pageIndex) {
-            try {
-                grid.pageIndex(targetPage - 1);
-                triggered = true;
-            } catch (_) {}
+        // Nguồn thứ hai: tổng kết quả / pageSize.
+        const pageSize = getPageSize();
+        if (Number.isFinite(totalCount) && totalCount > 0) {
+            const estimatedPages = Math.ceil(totalCount / pageSize);
+            if (estimatedPages > currentPage) return true;
         }
 
-        if (!triggered) {
-            const numbered = findPageNumberButton(targetPage);
-            if (numbered) triggered = robustClick(numbered);
-        }
+        // Nguồn thứ ba: pager DOM.
+        const nums = getPagerNumberNodes()
+            .map(x => x.n)
+            .filter(Number.isFinite);
 
-        if (!triggered) {
-            const next = findNextPageButton();
-            if (next) triggered = robustClick(next);
-        }
-        if (!triggered) return false;
+        if (nums.some(n => n > currentPage)) return true;
 
-        const stableReady = createStableListReadyCheck(400);
-        const changed = await waitFor(
-            () => getCurrentPageNumber() === targetPage &&
-                listSignature() !== oldSignature && stableReady(),
-            20000,
-            100
-        );
+        const next = findNextPageButton();
+        return !!(next && !pagerNodeDisabled(next));
+    }
+
+    async function confirmPageMoved(oldPage, oldSig, targetPage = null) {
+        const model = getCurrentModel();
+
+        const changed = await waitFor(() => {
+            if (isListLoading()) return false;
+
+            const pageNow = getCurrentPageNumber();
+            const sigNow = getRenderedPageSignature();
+
+            const pageChanged = pageNow !== oldPage;
+            const targetReached = targetPage == null || pageNow === targetPage;
+            const sigChanged = sigNow !== oldSig;
+
+            return targetReached && (pageChanged || sigChanged);
+        }, 20000, 120);
+
         if (!changed) return false;
+
+        // Sau khi pager đổi, chờ bảng thật sự render xong.
+        const stableReady = createStableListReadyCheck(900);
+        const ready = await waitFor(() => {
+            if (!stableReady()) return false;
+            if (getResultCount() === 0) return true;
+
+            return model === 'M4'
+                ? getM4RowCandidates().length > 0
+                : findPencilLinks().length > 0;
+        }, 20000, 120);
+
+        if (!ready) return false;
+
+        await sleep(180);
         return true;
+    }
+
+    async function tryGridPageIndex(targetPage, oldPage, oldSig) {
+        const grid = getListGridInstance();
+        if (!grid?.pageIndex) return false;
+
+        try {
+            grid.pageIndex(targetPage - 1);
+        } catch (_) {
+            return false;
+        }
+
+        return await confirmPageMoved(oldPage, oldSig, targetPage);
+    }
+
+    // return: 'MOVED' | 'LAST' | 'BLOCKED'
+    async function goNextPageIfPossible(totalCount) {
+        const oldPage = getCurrentPageNumber();
+        const targetPage = oldPage + 1;
+        const oldSig = getRenderedPageSignature();
+        const mustHaveNext = pagerSaysThereMustBeAnotherPage(totalCount, oldPage);
+
+        if (!mustHaveNext) return 'LAST';
+
+        showStatus(`Trang ${oldPage}: đã xử lý hết ca đang thấy → sang trang ${targetPage}...`);
+
+        // 1) DevExtreme API
+        if (await tryGridPageIndex(targetPage, oldPage, oldSig)) {
+            return 'MOVED';
+        }
+
+        // 2) Bấm trực tiếp số trang kế tiếp
+        let b = findNumericPageButton(targetPage);
+        if (b) {
+            robustClick(b);
+            if (await confirmPageMoved(oldPage, oldSig, targetPage)) {
+                return 'MOVED';
+            }
+        }
+
+        // 3) Nút Next nhiều biến thể
+        b = findNextPageButton();
+        if (b) {
+            robustClick(b);
+            if (await confirmPageMoved(oldPage, oldSig, targetPage)) {
+                return 'MOVED';
+            }
+        }
+
+        // Quan trọng: còn bằng chứng có trang kế thì KHÔNG ĐƯỢC báo hoàn tất.
+        warn('PAGER BLOCKED: còn trang kế nhưng chưa chuyển được.', {
+            model: getCurrentModel(),
+            totalCount,
+            oldPage,
+            targetPage,
+            pageSize: getPageSize(),
+            pagerNumbers: getPagerNumberNodes().map(x => x.n)
+        });
+
+        return 'BLOCKED';
     }
 
     function getCurrentQualityFilterText() {
@@ -2654,12 +2907,18 @@ Tổng ERROR: ${errors.length}`;
                 return;
             }
 
-            if (await goNextPageIfPossible()) {
-                queueRun();
+            const pageMoveM4 = await goNextPageIfPossible(resultCount);
+            if (pageMoveM4 === 'MOVED') {
+                queueRun(120);
+                return;
+            }
+            if (pageMoveM4 === 'BLOCKED') {
+                showStatus(`M4 · còn trang kế nhưng Medinet chưa chuyển trang được · đang thử lại...`);
+                queueRun(1200);
                 return;
             }
 
-            finishBatch('Đã quét hết các trang M4; chỉ còn ca đã SKIP/DONE hoặc không còn ca thiếu CLS.');
+            finishBatch('Đã quét hết trang cuối M4; chỉ còn ca đã SKIP/DONE hoặc không còn ca thiếu CLS.');
             return;
         }
 
@@ -2705,12 +2964,18 @@ Tổng ERROR: ${errors.length}`;
             throw new Error(`M3: đã thấy ${pencilLinks.length} nút Xử lý nhưng không đọc được Họ tên/Ngày khám của dòng.`);
         }
 
-        if (await goNextPageIfPossible()) {
-            queueRun();
+        const pageMoveM3 = await goNextPageIfPossible(resultCount);
+        if (pageMoveM3 === 'MOVED') {
+            queueRun(120);
+            return;
+        }
+        if (pageMoveM3 === 'BLOCKED') {
+            showStatus(`M3 · còn trang kế nhưng Medinet chưa chuyển trang được · đang thử lại...`);
+            queueRun(1200);
             return;
         }
 
-        finishBatch('Đã quét hết các trang; chỉ còn ca đã SKIP hoặc không còn ca thiếu CLS.');
+        finishBatch('Đã quét hết trang cuối M3; chỉ còn ca đã SKIP/DONE hoặc không còn ca thiếu CLS.');
     }
 
 
