@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.0.12
-// @description  Tự nhận diện M3/M4: tìm XN theo Họ tên + ngày XN, điền/lưu CLS, mở/lưu Kết luận, quay lại danh sách và tiếp tục batch.
+// @version      2.0.14
+// @description  Tự nhận diện M3/M4: có XN thì điền, không có XN vẫn lưu CLS; sau đó lưu Kết luận, quay lại danh sách và tiếp tục batch.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
 // @run-at       document-idle
@@ -20,7 +20,8 @@
     // - Một ca chỉ được tính DONE sau chuỗi:
     //     điền CLS -> Lưu CLS -> mở Kết luận -> Lưu Kết luận
     //     -> quay về Danh sách -> chờ bảng tải ổn định -> tiếp tục ca kế.
-    // - Không tìm thấy XN / trùng XN / dữ liệu không đủ chắc chắn => SKIP.
+    // - Không tìm thấy XN => vẫn Lưu CLS trống rồi mở/lưu Kết luận.
+    // - Trùng XN / dữ liệu không đủ chắc chắn => SKIP.
     // - Lỗi kỹ thuật => RETRY giới hạn, sau đó ghi ERROR và tiếp tục.
     // - Không tự đoán kết quả xét nghiệm.
 
@@ -420,6 +421,24 @@
         return !!getLocalJson(KEY_SKIPPED, {})[caseKey(c)];
     }
 
+    function releaseLegacyNotFoundSkips() {
+        // Bản cũ từng đưa ca không tìm thấy XN vào SKIP. Từ v2.0.13 các ca này
+        // phải được chạy lại để lưu CLS trống + Kết luận; chỉ gỡ NOT_FOUND,
+        // giữ nguyên DUPLICATE/INVALID vì đó là các ca chưa đủ chắc chắn.
+        const skipped = getLocalJson(KEY_SKIPPED, {});
+        let released = 0;
+        for (const [key, item] of Object.entries(skipped)) {
+            if (item?.type !== 'NOT_FOUND') continue;
+            delete skipped[key];
+            released++;
+        }
+        if (released) {
+            setLocalJson(KEY_SKIPPED, skipped);
+            log(`Đã mở lại ${released} ca NOT_FOUND cũ để lưu CLS trống + Kết luận.`);
+        }
+        return released;
+    }
+
     async function addError(c, reason) {
         const stage = getStage();
         const retryCount = getRetryCount(c || {}, stage);
@@ -785,14 +804,13 @@
         const avg = s.timedCases ? ((s.totalProcessMs || 0) / 60000 / s.timedCases).toFixed(1) + ' phút/ca' : '—';
         const started = s.startedAt ? new Date(s.startedAt).toLocaleString('vi-VN') : '—';
 
-        let txt = `AUTO CLS SMART ${getModelLabel()} v2.0.11 - SINGLE TAB
+        let txt = `AUTO CLS SMART ${getModelLabel()} v2.0.14 - SINGLE TAB
 Bắt đầu: ${started}
 
 === THỐNG KÊ PHIÊN NÀY ===
 Đã xử lý: ${processed}
 Hoàn tất: ${done} (${success})
 Bỏ qua: ${skippedCount}
-  - Không tìm thấy XN: ${s.skippedNotFound || 0}
   - Trùng kết quả: ${s.skippedDuplicate || 0}
   - Không hợp lệ/lỗi: ${s.skippedInvalid || 0}
 Lỗi ghi nhận: ${s.errors || 0}
@@ -886,7 +904,7 @@ Tổng ERROR: ${errors.length}`;
             const proceed = await confirmBatchBubble(`Bộ lọc hiện là “${quality}”`, `AUTO CLS ${model} được thiết kế cho “Chưa có cận lâm sàng”. Ông vẫn muốn chạy?`, { type: 'warn', okText: 'VẪN CHẠY' });
             if (!proceed) return;
         }
-        const confirmed = await confirmBatchBubble(`Bắt đầu AUTO CLS ${model}?`, `Script sẽ tự lưu trên Medinet:\n1) Điền + lưu Cận lâm sàng\n2) Mở + lưu Kết luận\n3) Quay lại danh sách và tiếp tục ca kế\n\nNên theo dõi kỹ vài ca đầu.`, { type: 'info', okText: `CHẠY ${model}` });
+        const confirmed = await confirmBatchBubble(`Bắt đầu AUTO CLS ${model}?`, `Script sẽ tự lưu trên Medinet:\n1) Có XN: điền + lưu Cận lâm sàng\n2) Không có XN: vẫn lưu Cận lâm sàng trống\n3) Mở + lưu Kết luận\n4) Quay lại danh sách và tiếp tục ca kế\n\nChỉ chừa lại ca trùng hoặc dữ liệu không chắc chắn. Nên theo dõi kỹ vài ca đầu.`, { type: 'info', okText: `CHẠY ${model}` });
         if (!confirmed) return;
 
         resetRunState();
@@ -1596,7 +1614,7 @@ Tổng ERROR: ${errors.length}`;
     }
 
     // =====================================================================
-    // PAGER ROBUST - v2.0.12
+    // PAGER ROBUST - v2.0.14
     // =====================================================================
     // M3/M4 đều dùng DevExtreme nhưng DOM pager có thể khác nhau theo route/theme.
     // Tuyệt đối không kết luận hết batch chỉ vì không bắt được một selector "Next".
@@ -1668,8 +1686,15 @@ Tổng ERROR: ${errors.length}`;
     }
 
     function getCurrentPageNumber() {
-        // DOM pager phản ánh trang người dùng đang thấy; ưu tiên trước grid instance
-        // vì M4 đôi lúc instance cũ vẫn tồn tại trong lúc Angular thay grid.
+        // Instance của đúng grid đang hiển thị là nguồn ổn định nhất sau khi
+        // bảng đã tải xong. Ưu tiên nó để tránh DOM pager còn giữ số trang cũ.
+        const grid = getListGridInstance();
+        try {
+            const index = Number(grid?.pageIndex?.());
+            if (Number.isFinite(index) && index >= 0) return index + 1;
+        } catch (_) {}
+
+        // Dự phòng khi route chưa expose được instance DevExtreme.
         const explicit = [
             ...document.querySelectorAll(
                 '.dx-page.dx-selection, .dx-page[aria-current="page"], .dx-page-selected, ' +
@@ -1684,12 +1709,6 @@ Tổng ERROR: ${errors.length}`;
 
         const selected = getPagerNumberNodes().find(x => x.selected);
         if (selected?.n) return selected.n;
-
-        const grid = getListGridInstance();
-        try {
-            const index = Number(grid?.pageIndex?.());
-            if (Number.isFinite(index) && index >= 0) return index + 1;
-        } catch (_) {}
 
         return 1;
     }
@@ -1735,6 +1754,33 @@ Tổng ERROR: ${errors.length}`;
 
         const keys = cases.map(c => `${c?.cccd || ''}|${c?.hoTen || ''}|${c?.ngayKham || ''}`);
         return `${model || '?'}|${getCurrentPageNumber()}|${getResultCount() ?? '?'}|${keys.join('||')}`;
+    }
+
+    function getRenderedRowsSignature() {
+        const model = getCurrentModel();
+        let cases = [];
+
+        if (model === 'M4') {
+            cases = getM4RowCandidates().slice(0, 10).map(x => x.c);
+        } else {
+            cases = findPencilLinks()
+                .slice(0, 10)
+                .map(link => parseCaseFromPencil(link))
+                .filter(Boolean);
+        }
+
+        return cases
+            .map(c => `${c?.cccd || ''}|${norm(c?.hoTen || '')}|${c?.ngayKham || ''}`)
+            .join('||');
+    }
+
+    function getGridPageNumber() {
+        const grid = getListGridInstance();
+        try {
+            const index = Number(grid?.pageIndex?.());
+            if (Number.isFinite(index) && index >= 0) return index + 1;
+        } catch (_) {}
+        return null;
     }
 
     function findNextPageButton() {
@@ -1826,20 +1872,28 @@ Tổng ERROR: ${errors.length}`;
         return !!(next && !pagerNodeDisabled(next));
     }
 
-    async function confirmPageMoved(oldPage, oldSig, targetPage = null) {
+    async function confirmPageMoved(oldPage, oldSig, oldRowsSig, targetPage = null) {
         const model = getCurrentModel();
 
         const changed = await waitFor(() => {
             if (isListLoading()) return false;
 
             const pageNow = getCurrentPageNumber();
+            const gridPageNow = getGridPageNumber();
             const sigNow = getRenderedPageSignature();
+            const rowsSigNow = getRenderedRowsSignature();
 
             const pageChanged = pageNow !== oldPage;
-            const targetReached = targetPage == null || pageNow === targetPage;
+            const gridReachedTarget = targetPage != null && gridPageNow === targetPage;
+            const pagerReachedTarget = targetPage != null && pageNow === targetPage;
+            const rowsChanged = !!rowsSigNow && !!oldRowsSig && rowsSigNow !== oldRowsSig;
             const sigChanged = sigNow !== oldSig;
 
-            return targetReached && (pageChanged || sigChanged);
+            // Một số trang Medinet đã đổi dữ liệu nhưng DOM pager vẫn giữ số cũ
+            // trong vài giây hoặc giữ hẳn instance cũ. Chỉ cần một bằng chứng
+            // chắc chắn cho thấy trang/bảng đã đổi; không bắt buộc mọi nguồn
+            // cùng báo đúng targetPage.
+            return pageChanged || gridReachedTarget || pagerReachedTarget || rowsChanged || sigChanged;
         }, 20000, 120);
 
         if (!changed) return false;
@@ -1861,7 +1915,7 @@ Tổng ERROR: ${errors.length}`;
         return true;
     }
 
-    async function tryGridPageIndex(targetPage, oldPage, oldSig) {
+    async function tryGridPageIndex(targetPage, oldPage, oldSig, oldRowsSig) {
         const grid = getListGridInstance();
         if (!grid?.pageIndex) return false;
 
@@ -1871,7 +1925,7 @@ Tổng ERROR: ${errors.length}`;
             return false;
         }
 
-        return await confirmPageMoved(oldPage, oldSig, targetPage);
+        return await confirmPageMoved(oldPage, oldSig, oldRowsSig, targetPage);
     }
 
     // return: 'MOVED' | 'LAST' | 'BLOCKED'
@@ -1879,6 +1933,7 @@ Tổng ERROR: ${errors.length}`;
         const oldPage = getCurrentPageNumber();
         const targetPage = oldPage + 1;
         const oldSig = getRenderedPageSignature();
+        const oldRowsSig = getRenderedRowsSignature();
         const mustHaveNext = pagerSaysThereMustBeAnotherPage(totalCount, oldPage);
 
         if (!mustHaveNext) return 'LAST';
@@ -1886,7 +1941,7 @@ Tổng ERROR: ${errors.length}`;
         showStatus(`Trang ${oldPage}: đã xử lý hết ca đang thấy → sang trang ${targetPage}...`);
 
         // 1) DevExtreme API
-        if (await tryGridPageIndex(targetPage, oldPage, oldSig)) {
+        if (await tryGridPageIndex(targetPage, oldPage, oldSig, oldRowsSig)) {
             return 'MOVED';
         }
 
@@ -1894,7 +1949,7 @@ Tổng ERROR: ${errors.length}`;
         let b = findNumericPageButton(targetPage);
         if (b) {
             robustClick(b);
-            if (await confirmPageMoved(oldPage, oldSig, targetPage)) {
+            if (await confirmPageMoved(oldPage, oldSig, oldRowsSig, targetPage)) {
                 return 'MOVED';
             }
         }
@@ -1903,7 +1958,7 @@ Tổng ERROR: ${errors.length}`;
         b = findNextPageButton();
         if (b) {
             robustClick(b);
-            if (await confirmPageMoved(oldPage, oldSig, targetPage)) {
+            if (await confirmPageMoved(oldPage, oldSig, oldRowsSig, targetPage)) {
                 return 'MOVED';
             }
         }
@@ -3048,7 +3103,17 @@ Tổng ERROR: ${errors.length}`;
         showStatus(`Tìm XN: ${c.hoTen} · ngày XN ${c.ngayKham}`);
         const match = await findLabForCase(c);
         if (match.status === 'NOT_FOUND') {
-            await skipCurrent('Không tìm thấy XN khớp chính xác Họ tên + Ngày XN/Ngày khám.', 'NOT_FOUND');
+            // Theo quy trình: ca không có kết quả xét nghiệm vẫn phải bấm Lưu
+            // Cận lâm sàng và tiếp tục Lưu Kết luận. Chỉ SKIP khi có nhiều
+            // kết quả hoặc dữ liệu không đủ chắc chắn để tự chọn.
+            c.noLab = true;
+            c.sid = '';
+            // Cờ này chỉ tồn tại trong ca đang chạy để bỏ qua bước chờ lệnh
+            // điền. Không đưa ca không có XN vào SKIP/ERROR/báo cáo.
+            setCase(c);
+            setStage(STAGE.SAVE_CLS);
+            showStatus('Không có XN · vẫn chuẩn bị lưu Cận lâm sàng trống...');
+            queueRun();
             return;
         }
         if (match.status === 'DUPLICATE') {
@@ -3073,12 +3138,16 @@ Tổng ERROR: ${errors.length}`;
             return;
         }
 
-        showStatus('CLS đã đầy đủ và đứng yên · chuẩn bị lưu Cận lâm sàng...');
-        const writesFinished = await waitForClsWritesFinished();
-        if (!writesFinished) {
-            showStatus('Tab đang ẩn hoặc lệnh điền chưa hoàn tất · chưa bấm Lưu...');
-            queueRun(1000);
-            return;
+        if (c.noLab) {
+            showStatus('Không có XN · chuẩn bị lưu Cận lâm sàng trống...');
+        } else {
+            showStatus('CLS đã đầy đủ và đứng yên · chuẩn bị lưu Cận lâm sàng...');
+            const writesFinished = await waitForClsWritesFinished();
+            if (!writesFinished) {
+                showStatus('Tab đang ẩn hoặc lệnh điền chưa hoàn tất · chưa bấm Lưu...');
+                queueRun(1000);
+                return;
+            }
         }
 
         // Ghi stage TRƯỚC cú bấm. Nếu Medinet reload toàn trang ngay trong lúc
@@ -3199,6 +3268,9 @@ Tổng ERROR: ${errors.length}`;
         const c = getCase();
         if (!c) throw new Error('Mất ca vừa lưu Kết luận.');
 
+        // Ca không có XN được xem như ca hoàn tất bình thường. Xóa cờ nội bộ
+        // trước khi lưu DONE để không tạo log riêng cho nhóm này.
+        if (c.noLab) delete c.noLab;
         await addDone(c);
         const s = getStats();
         s.done++;
@@ -3234,7 +3306,7 @@ Tổng ERROR: ${errors.length}`;
         const success = processed ? ((Number(s.done || 0) / processed) * 100).toFixed(1) : '0.0';
         showBatchBubble(
             `AUTO CLS ${getModelLabel()} kết thúc`,
-            `${message}\n\nĐã xử lý: ${processed}\nHoàn tất: ${s.done || 0} (${success}%)\nBỏ qua: ${s.skipped || 0}\n• Không tìm thấy XN: ${s.skippedNotFound || 0}\n• Trùng kết quả: ${s.skippedDuplicate || 0}\n• Không hợp lệ/lỗi: ${s.skippedInvalid || 0}\nRetry: ${s.retries || 0}\nLỗi ghi nhận: ${s.errors || 0}\n\nBấm 📋 để xem chi tiết.`,
+            `${message}\n\nĐã xử lý: ${processed}\nHoàn tất: ${s.done || 0} (${success}%)\nBỏ qua: ${s.skipped || 0}\n• Trùng kết quả: ${s.skippedDuplicate || 0}\n• Không hợp lệ/lỗi: ${s.skippedInvalid || 0}\nRetry: ${s.retries || 0}\nLỗi ghi nhận: ${s.errors || 0}\n\nBấm 📋 để xem chi tiết.`,
             (s.errors || s.skipped) ? 'warn' : 'ok',
             10000
         );
@@ -3324,6 +3396,7 @@ Tổng ERROR: ${errors.length}`;
 
     async function init() {
         rememberDetectedModel();
+        releaseLegacyNotFoundSkips();
         installNetworkTracker();
         ensurePanel();
         installNavigationWatcher();
@@ -3339,7 +3412,7 @@ Tổng ERROR: ${errors.length}`;
             await sleep(700);
             queueRun();
         }
-        log('READY v2.0.6 SMART M3/M4 · SINGLE TAB');
+        log('READY v2.0.14 SMART M3/M4 · ROBUST PAGER · SINGLE TAB');
     }
 
     init();
