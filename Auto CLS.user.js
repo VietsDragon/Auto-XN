@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.0.14
+// @version      2.3.0
 // @description  Tự nhận diện M3/M4: có XN thì điền, không có XN vẫn lưu CLS; sau đó lưu Kết luận, quay lại danh sách và tiếp tục batch.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
@@ -22,9 +22,10 @@
     //     -> quay về Danh sách -> chờ bảng tải ổn định -> tiếp tục ca kế.
     // - Không tìm thấy XN => vẫn Lưu CLS trống rồi mở/lưu Kết luận.
     // - Trùng XN / dữ liệu không đủ chắc chắn => SKIP.
-    // - Lỗi kỹ thuật => RETRY giới hạn, sau đó ghi ERROR và tiếp tục.
+    // - Lỗi kỹ thuật => thử nhanh, gác tạm theo cooldown, rồi tự quay lại; không tự dừng batch.
     // - Không tự đoán kết quả xét nghiệm.
 
+    const SCRIPT_VERSION = '2.3.0';
     const LOG = '[AUTO CLS SMART BATCH]';
 
     // =====================================================================
@@ -87,11 +88,21 @@
     // v1.0-v1.3.4. SKIP được giữ lại để tránh chạy lại ngoài ý muốn.
     const KEY_SKIPPED = 'm34_cls_smart_skipped_v200';
     const KEY_DONE = 'm34_cls_smart_done_v200';
+    const KEY_PREVIOUS_DONE = 'm34_cls_smart_previous_done_before_v211';
     const KEY_ERRORS = 'm34_cls_smart_errors_v200';
     const KEY_RETRIES = 'm34_cls_smart_retries_v200';
     const KEY_LAST_URL = 'm34_cls_smart_last_url_v200';
+    const KEY_LIST_URL = 'm34_cls_smart_list_url_v220';
     const KEY_UI_MODE = 'm34_cls_smart_ui_mode_v202';
     const KEY_RELOAD_COUNT = 'm34_cls_smart_reload_count_v200';
+    const KEY_DEFERRED = 'm34_cls_smart_deferred_v220';
+    const KEY_PAGER_FAILURES = 'm34_cls_smart_pager_failures_v220';
+    const KEY_HEARTBEAT = 'm34_cls_smart_heartbeat_v230';
+    const KEY_WATCHDOG_RECOVERIES = 'm34_cls_smart_watchdog_recoveries_v230';
+    const KEY_SCAN_RESTART = 'm34_cls_smart_scan_restart_v220';
+    const KEY_FORCE_PAGE_ONE = 'm34_cls_smart_force_page_one_v220';
+    const KEY_SCAN_SEEN = 'm34_cls_smart_scan_seen_v221';
+    const KEY_RUNTIME_VERSION = 'm34_cls_smart_runtime_version';
     // Mẫu hiện tại được ghi nhớ theo tab để khi từ danh sách đi vào hồ sơ
     // URL chi tiết vẫn biết chính xác đang chạy M3 hay M4.
     const KEY_MODEL = 'm34_cls_smart_model_v200';
@@ -141,6 +152,7 @@
         FILL_CLS: 'FILL_CLS',
         SAVE_CLS: 'SAVE_CLS',
         WAIT_CLS_RELOAD: 'WAIT_CLS_RELOAD',
+        VERIFY_CLS_SAVED: 'VERIFY_CLS_SAVED',
         OPEN_CONCLUSION: 'OPEN_CONCLUSION',
         SAVE_CONCLUSION: 'SAVE_CONCLUSION',
         RETURN_LIST: 'RETURN_LIST',
@@ -155,9 +167,88 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function touchHeartbeat(note = '') {
+        try {
+            setJson(KEY_HEARTBEAT, { time: Date.now(), stage: getStage(), note: String(note || '') });
+        } catch (_) {}
+    }
+
+    async function waitUntilOnline(context = 'kết nối mạng') {
+        while (isActive() && navigator.onLine === false) {
+            showStatus(`Mất mạng · đang chờ ${context}; có mạng lại auto sẽ tự tiếp tục...`);
+            touchHeartbeat('WAIT_OFFLINE');
+            await sleep(10000);
+        }
+        return isActive();
+    }
+
+    let safeReloadInFlight = false;
+
+    async function requestSafeReload(reason = 'phục hồi trang', delayMs = 0) {
+        if (safeReloadInFlight || !isActive()) return false;
+        safeReloadInFlight = true;
+        try {
+            if (!await waitUntilOnline(reason)) {
+                safeReloadInFlight = false;
+                return false;
+            }
+            if (delayMs > 0) {
+                showStatus(`${reason} · chờ ${Math.ceil(delayMs / 1000)} giây rồi tự tải lại...`);
+                await sleep(Math.min(60000, delayMs));
+                if (!isActive()) {
+                    safeReloadInFlight = false;
+                    return false;
+                }
+            }
+
+            touchHeartbeat(`RELOAD: ${reason}`);
+            const hrefBefore = location.href;
+
+            // Timer này biến mất nếu reload thành công. Nếu cú reload bị trình
+            // duyệt bỏ qua, timer sẽ đánh thức và thử history.go(0), rồi gọi lại
+            // state machine thay vì để auto đứng im vô hạn.
+            setTimeout(() => {
+                if (!isActive() || location.href !== hrefBefore) return;
+                try { history.go(0); } catch (_) {}
+                setTimeout(() => {
+                    safeReloadInFlight = false;
+                    if (isActive()) queueRun(1000);
+                }, 12000);
+            }, 15000);
+
+            location.reload();
+            return true;
+        } catch (error) {
+            safeReloadInFlight = false;
+            throw error;
+        } finally {
+            // Nếu navigation thành công context sẽ bị hủy. Nếu không, fallback
+            // timer phía trên sẽ mở khóa; không mở khóa ngay để tránh reload kép.
+        }
+    }
+
     // Theo dõi request mạng phát sinh từ nút Lưu. @grant none giúp userscript
     // chạy cùng page context và bắt được cả fetch lẫn XMLHttpRequest.
     const NET = { installed: false, seq: 0, records: new Map() };
+    const CLS_CONTROL_IDS = new WeakMap();
+    let CLS_CONTROL_SEQ = 0;
+
+    function getClsControlId(node) {
+        if (!node) return 'none';
+        if (!CLS_CONTROL_IDS.has(node)) CLS_CONTROL_IDS.set(node, ++CLS_CONTROL_SEQ);
+        return CLS_CONTROL_IDS.get(node);
+    }
+
+    function hasPendingClsNetwork(sinceAt = 0) {
+        return [...NET.records.values()].some(r => {
+            if (r.done || Number(r.startedAt || 0) < sinceAt) return false;
+            const method = String(r.method || 'GET').toUpperCase();
+            const url = norm(r.url || '').replace(/\s/g, '');
+            const mutating = /^(POST|PUT|PATCH|DELETE)$/.test(method);
+            const clsRelated = /canlamsang|phieucls|xetnghiem|kskdk|nguoicaotuoi/.test(url);
+            return mutating || clsRelated;
+        });
+    }
 
     function beginNetRecord(url, method) {
         const id = ++NET.seq;
@@ -372,7 +463,17 @@
         sessionStorage.removeItem(KEY_STATS);
         sessionStorage.removeItem(KEY_RETRIES);
         sessionStorage.removeItem(KEY_RELOAD_COUNT);
-        // DONE/SKIP/ERROR được giữ lại giữa các lần chạy để tránh xử lý lại ca cũ.
+        sessionStorage.removeItem(KEY_PAGER_FAILURES);
+        sessionStorage.removeItem(KEY_HEARTBEAT);
+        sessionStorage.removeItem(KEY_WATCHDOG_RECOVERIES);
+        sessionStorage.removeItem(KEY_SCAN_RESTART);
+        sessionStorage.removeItem(KEY_FORCE_PAGE_ONE);
+        sessionStorage.removeItem(KEY_SCAN_SEEN);
+        // Danh sách đang lọc "Chưa có cận lâm sàng" là nguồn sự thật. Khi người
+        // dùng bắt đầu phiên mới, ca vẫn còn trong danh sách phải được phép chạy
+        // lại; không để DONE cũ khiến auto bỏ qua hàng loạt. SKIP mơ hồ và ERROR
+        // vẫn giữ để người dùng rà soát.
+        localStorage.removeItem(KEY_DONE);
     }
 
     function caseKey(c) {
@@ -439,6 +540,31 @@
         return released;
     }
 
+    function releaseLegacyTechnicalSkips() {
+        // Các bản cũ từng biến lỗi mạng/render/mở trang thành INVALID vĩnh viễn.
+        // v2.2 chỉ giữ SKIP cho dữ liệu mơ hồ; lỗi kỹ thuật phải được mở lại.
+        const skipped = getLocalJson(KEY_SKIPPED, {});
+        let released = 0;
+        for (const [key, item] of Object.entries(skipped)) {
+            const reason = norm(item?.reason || '');
+            const technical = item?.type === 'INVALID' && (
+                reason.startsWith('loi sau') ||
+                reason.startsWith('loi luu') ||
+                reason.includes('khong mo duoc') ||
+                reason.includes('khong tai') ||
+                reason.includes('chua render')
+            );
+            if (!technical) continue;
+            delete skipped[key];
+            released++;
+        }
+        if (released) {
+            setLocalJson(KEY_SKIPPED, skipped);
+            log(`Đã mở lại ${released} ca lỗi kỹ thuật cũ để cơ chế chạy đêm tự thử lại.`);
+        }
+        return released;
+    }
+
     async function addError(c, reason) {
         const stage = getStage();
         const retryCount = getRetryCount(c || {}, stage);
@@ -463,6 +589,107 @@
         all[k] = (all[k] || 0) + 1;
         setJson(KEY_RETRIES, all);
         return all[k];
+    }
+
+    function clearRetry(c, stage) {
+        const all = getJson(KEY_RETRIES, {});
+        delete all[`${caseKey(c)}|${stage}`];
+        setJson(KEY_RETRIES, all);
+    }
+
+    function getDeferredMap() {
+        return getJson(KEY_DEFERRED, {});
+    }
+
+    function getDeferredRecord(c) {
+        return getDeferredMap()[caseKey(c)] || null;
+    }
+
+    function isDeferredActive(c) {
+        const item = getDeferredRecord(c);
+        return !!item && Number(item.retryAt || 0) > Date.now();
+    }
+
+    function removeDeferred(c) {
+        const key = caseKey(c);
+        if (!key) return;
+        const all = getDeferredMap();
+        if (all[key]) {
+            delete all[key];
+            setJson(KEY_DEFERRED, all);
+        }
+    }
+
+    function listDeferred(model = '') {
+        return Object.values(getDeferredMap())
+            .filter(x => x?.c && (!model || x.c.model === model))
+            .sort((a, b) => Number(a.retryAt || 0) - Number(b.retryAt || 0));
+    }
+
+    function deferredDelayMs(attempts) {
+        return Math.min(15 * 60 * 1000, 30000 * (2 ** Math.min(5, Math.max(0, attempts - 1))));
+    }
+
+    function saveDeferred(c, stage, reason) {
+        const key = caseKey(c);
+        if (!key) return null;
+        const all = getDeferredMap();
+        const previous = all[key];
+        const attempts = Math.max(
+            Number(c?.deferAttempts || 0),
+            Number(previous?.attempts || 0)
+        ) + 1;
+        const delayMs = deferredDelayMs(attempts);
+        const copy = { ...c, deferAttempts: attempts };
+        all[key] = {
+            c: copy,
+            stage,
+            reason: String(reason || ''),
+            attempts,
+            retryAt: Date.now() + delayMs,
+            resumeUrl: isListPage() ? (previous?.resumeUrl || copy.detailUrl || '') : location.href,
+            time: Date.now()
+        };
+        setJson(KEY_DEFERRED, all);
+        return all[key];
+    }
+
+    function prepareDeferredCase(c) {
+        const item = getDeferredRecord(c);
+        if (!item || Number(item.retryAt || 0) > Date.now()) return c;
+        removeDeferred(c);
+        return { ...c, deferAttempts: Number(item.attempts || 0) };
+    }
+
+    function resumeDueDeferredFromList() {
+        const due = listDeferred(getCurrentModel()).find(x => Number(x.retryAt || 0) <= Date.now());
+        if (!due?.resumeUrl || !due?.c) return false;
+        try {
+            const target = new URL(due.resumeUrl, location.href);
+            if (target.origin !== location.origin) return false;
+        } catch (_) {
+            return false;
+        }
+        removeDeferred(due.c);
+        const c = { ...due.c, deferAttempts: Number(due.attempts || 0) };
+        setCase(c);
+        setStage(due.stage || STAGE.OPEN_CLS);
+        showStatus(`Đến lượt thử lại ca đã gác: ${c.hoTen || c.cccd || ''}...`);
+        location.href = due.resumeUrl;
+        return true;
+    }
+
+    function scheduleDeferredWake(model) {
+        const items = listDeferred(model);
+        if (!items.length) return false;
+        const waitMs = Math.max(1000, Number(items[0].retryAt || 0) - Date.now());
+        const pollMs = Math.min(60000, waitMs);
+        showStatus(
+            `${model} · còn ${items.length} ca lỗi kỹ thuật đang gác · ` +
+            `tự thử lại sau khoảng ${Math.max(1, Math.ceil(waitMs / 60000))} phút...`
+        );
+        queueRun(pollMs);
+        return true;
     }
 
 
@@ -620,7 +847,7 @@
         p.innerHTML = `
             <div class="h">
                 <div class="m3cls-reactor"><b id="m3cls-model">M?</b></div>
-                <div class="m3cls-title"><div class="m3cls-title-main">AUTO CLS SMART</div><div class="m3cls-title-sub">MEDINET · M3 / M4</div></div>
+                <div class="m3cls-title"><div class="m3cls-title-main">AUTO CLS SMART</div><div class="m3cls-title-sub">MEDINET · M3 / M4 · v${SCRIPT_VERSION}</div></div>
                 <div class="m3cls-header-tools"><span id="m3cls-active-label" class="m3cls-state">SẴN SÀNG</span><button id="m3cls-toggle" class="m3cls-toggle" type="button" title="Thu nhỏ">—</button></div>
             </div>
             <div class="b">
@@ -721,6 +948,7 @@
     }
 
     function showStatus(message) {
+        touchHeartbeat(message);
         ensurePanel();
         const el = document.getElementById('m3cls-status-line');
         if (el) el.textContent = String(message || '');
@@ -796,6 +1024,11 @@
         const errors = getLocalJson(KEY_ERRORS, [])
             .slice()
             .sort((a, b) => new Date(a.time || 0) - new Date(b.time || 0));
+        const previousDoneArchive = getLocalJson(KEY_PREVIOUS_DONE, null);
+        const previousDone = Array.isArray(previousDoneArchive?.items)
+            ? previousDoneArchive.items
+            : [];
+        const deferred = listDeferred();
         const s = getStats();
         const processed = Number(s.processed || 0);
         const done = Number(s.done || 0);
@@ -804,7 +1037,7 @@
         const avg = s.timedCases ? ((s.totalProcessMs || 0) / 60000 / s.timedCases).toFixed(1) + ' phút/ca' : '—';
         const started = s.startedAt ? new Date(s.startedAt).toLocaleString('vi-VN') : '—';
 
-        let txt = `AUTO CLS SMART ${getModelLabel()} v2.0.14 - SINGLE TAB
+        let txt = `AUTO CLS SMART ${getModelLabel()} v${SCRIPT_VERSION} - SINGLE TAB
 Bắt đầu: ${started}
 
 === THỐNG KÊ PHIÊN NÀY ===
@@ -815,11 +1048,28 @@ Bỏ qua: ${skippedCount}
   - Không hợp lệ/lỗi: ${s.skippedInvalid || 0}
 Lỗi ghi nhận: ${s.errors || 0}
 Retry: ${s.retries || 0}
+Watchdog tự phục hồi: ${Number(sessionStorage.getItem(KEY_WATCHDOG_RECOVERIES) || 0)}
 Tốc độ trung bình: ${avg}
 
 === DỮ LIỆU ĐANG LƯU ===
 Tổng SKIP: ${skipped.length}
-Tổng ERROR: ${errors.length}`;
+Tổng ERROR: ${errors.length}
+Đang gác để tự thử lại: ${deferred.length}
+Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}`;
+
+        if (deferred.length) {
+            txt += `\n\n=== ĐANG GÁC – AUTO SẼ TỰ THỬ LẠI ===\n` + deferred.map((x, i) => {
+                const c = x.c || {};
+                return `${i + 1}. ${c.hoTen || '?'} | ${c.cccd || '?'} | khám ${c.ngayKham || '?'} | stage=${x.stage || '?'} | lần gác=${x.attempts || 1} | thử lại ${new Date(x.retryAt).toLocaleString('vi-VN')} | ${x.reason || ''}`;
+            }).join('\n');
+        }
+
+        if (previousDone.length) {
+            txt += `\n\n=== CA BẢN CŨ CẦN RÀ LẠI NƯỚC TIỂU ===\n` + previousDone.map((x, i) => {
+                const c = x?.c || x || {};
+                return `${i + 1}. Trang ${c.pageNumber || '?'} · STT ${c.rowStt || '?'} | ${c.hoTen || '?'} | ${c.cccd || '?'} | khám ${c.ngayKham || '?'} | SID ${c.sid || '?'}`;
+            }).join('\n');
+        }
 
         if (skipped.length) {
             txt += `\n\n=== SKIP ===\n` + skipped.map((x, i) =>
@@ -908,6 +1158,7 @@ Tổng ERROR: ${errors.length}`;
         if (!confirmed) return;
 
         resetRunState();
+        safeReloadInFlight = false;
         saveStats({
             processed: 0, done: 0, skipped: 0,
             skippedNotFound: 0, skippedDuplicate: 0, skippedInvalid: 0,
@@ -923,6 +1174,7 @@ Tổng ERROR: ${errors.length}`;
 
     async function stopBatch() {
         setActive(false);
+        safeReloadInFlight = false;
         hideStatus();
         updatePanel();
         showBatchBubble(`Đã dừng AUTO CLS ${getModelLabel()}`, 'Trạng thái ca hiện tại vẫn được giữ để kiểm tra thủ công.', 'warn', 5500);
@@ -955,11 +1207,22 @@ Tổng ERROR: ${errors.length}`;
     }
 
     async function waitFor(fn, timeout = 30000, interval = 150) {
-        const start = Date.now();
-        while (Date.now() - start < timeout) {
+        let remaining = timeout;
+        let lastTick = Date.now();
+        while (remaining > 0) {
+            // Không tính thời gian máy mất mạng hoặc tab bị trình duyệt treo nền
+            // vào timeout. Khi quay lại, auto tiếp tục phần thời gian còn lại.
+            if (document.hidden || navigator.onLine === false) {
+                lastTick = Date.now();
+                await sleep(Math.max(250, interval));
+                continue;
+            }
             const v = fn();
             if (v) return v;
             await sleep(interval);
+            const now = Date.now();
+            remaining -= Math.max(0, now - lastTick);
+            lastTick = now;
         }
         return null;
     }
@@ -967,20 +1230,17 @@ Tổng ERROR: ${errors.length}`;
     // Giữ đúng cơ chế đã chạy ổn ở Auto KL M2: không xử lý ngay khi khung
     // HTML vừa xuất hiện; chờ document hoàn tất rồi cho Angular thêm 700 ms.
     async function waitPageReady(timeoutMs = 30000) {
-        const startedAt = Date.now();
-        while (Date.now() - startedAt < timeoutMs) {
-            if (document.readyState === 'complete' && (document.body.innerText || '').length > 50) {
-                await sleep(700);
-                return true;
-            }
-            await sleep(150);
-        }
-        return false;
+        const ready = await waitFor(() =>
+            document.readyState === 'complete' && (document.body.innerText || '').length > 50,
+        timeoutMs, 150);
+        if (!ready) return false;
+        await sleep(700);
+        return true;
     }
 
     // Ngoài điều kiện chung, từng trang có thể đưa thêm điều kiện dữ liệu đã render.
-    // Nếu Medinet tải dở, F5 tối đa 3 lần; stage/case vẫn nằm trong sessionStorage
-    // nên batch tiếp tục đúng chỗ cũ sau khi tải lại.
+    // Chế độ chạy đêm: không tự dừng sau vài lần. Thời gian chờ tăng dần và
+    // được chặn tối đa 60 giây để tránh F5 dồn dập khi mạng/Medinet đang lag.
     async function waitForPageReadyOrReload(timeoutMs = 30000, context = 'trang', extraReady = null) {
         let ready = await waitPageReady(timeoutMs);
         if (ready && extraReady) {
@@ -992,20 +1252,16 @@ Tổng ERROR: ${errors.length}`;
             return true;
         }
 
-        const reloadCount = Number(sessionStorage.getItem(KEY_RELOAD_COUNT) || 0);
-        if (reloadCount >= 3) {
-            sessionStorage.removeItem(KEY_RELOAD_COUNT);
-            setActive(false);
-            hideStatus();
-            updatePanel();
-            showBatchBubble('AUTO đã dừng', `Medinet không tải xong ${context} sau 3 lần F5. Tiến trình ca hiện tại vẫn được giữ lại.`, 'error', 9000);
-            return false;
-        }
-
-        sessionStorage.setItem(KEY_RELOAD_COUNT, String(reloadCount + 1));
-        showStatus(`Medinet chưa tải xong ${context} · F5 thử lại ${reloadCount + 1}/3...`);
-        await sleep(500);
-        location.reload();
+        const reloadCount = Number(sessionStorage.getItem(KEY_RELOAD_COUNT) || 0) + 1;
+        const delayMs = Math.min(60000, 2000 * (2 ** Math.min(5, reloadCount - 1)));
+        sessionStorage.setItem(KEY_RELOAD_COUNT, String(reloadCount));
+        showStatus(
+            `Medinet chưa tải xong ${context} · chờ ${Math.ceil(delayMs / 1000)} giây rồi tự F5 ` +
+            `(lần ${reloadCount}, không tự dừng)...`
+        );
+        await sleep(delayMs);
+        if (!isActive()) return false;
+        await requestSafeReload(`Medinet chưa tải xong ${context}`);
         return false;
     }
 
@@ -1054,24 +1310,58 @@ Tổng ERROR: ${errors.length}`;
     }
 
 
+    function getVisiblePageHeadings() {
+        return [...document.querySelectorAll(
+            'h1,h2,h3,h4,.hidden-web-title,.page-title,.card-title,.panel-title,legend'
+        )]
+            .filter(isVisibleElement)
+            .map(el => norm(el.textContent))
+            .filter(Boolean);
+    }
+
+    function isLikelyLoginPage() {
+        const hasPassword = !!document.querySelector('input[type="password"]');
+        const body = norm(document.body?.innerText || '');
+        return hasPassword && (body.includes('dang nhap') || body.includes('ten dang nhap'));
+    }
+
+    function hasVisibleFieldText(text) {
+        const target = norm(text);
+        return [...document.querySelectorAll(
+            'b,label,.control-label,.dx-field-item-label-text,.form-label,th'
+        )].some(el => isVisibleElement(el) && norm(el.textContent).includes(target));
+    }
+
     function isClsPage() {
-        const u = location.href;
-        const body = norm(document.body.innerText);
-        // Không dùng riêng chữ "Khám cận lâm sàng": chữ này luôn có trong
-        // sidebar, kể cả khi đang ở Thông tin hành chính.
-        return u.includes('KSKDK_Phieu_CanLamSang') ||
-               u.includes('KNCT_PhieuCLS_CanLamSang') ||
-               u.includes('KNCT_PhieuCLS') ||
-               body.includes('ket qua xet nghiem mau') &&
-                   (body.includes('so luong hc') || body.includes('huyet sac to')) ||
-               body.includes('kham suc khoe dinh ky') && body.includes('so luong hc');
+        const u = location.href || '';
+        const headings = getVisiblePageHeadings();
+        const hasClsHeading = headings.some(t =>
+            t.includes('kham can lam sang') ||
+            t.includes('can lam sang') ||
+            t.includes('ket qua xet nghiem')
+        );
+        const hasVisibleBloodFields =
+            hasVisibleFieldText('so luong hc') ||
+            hasVisibleFieldText('huyet sac to');
+        const clsRoute =
+            u.includes('KSKDK_Phieu_CanLamSang') ||
+            u.includes('KNCT_PhieuCLS_CanLamSang') ||
+            u.includes('KNCT_PhieuCLS');
+
+        // Không đọc document.body vì Angular giữ DOM của tab CLS ở trạng thái
+        // ẩn ngay cả khi người dùng đang đứng tại Thông tin hành chính.
+        return (hasClsHeading || hasVisibleBloodFields) &&
+            (clsRoute || hasVisibleBloodFields || !!findVisibleButtonByText('lưu thay đổi'));
     }
 
     function isConclusionPage() {
-        const body = norm(document.body.innerText);
-        const title = norm((document.querySelector('h2.hidden-web-title,.hidden-web-title') || {}).textContent || '');
-        return title.includes('ket luan') ||
-               body.includes('phan loai suc khoe') && body.includes('de nghi') && body.includes('luu thay doi');
+        const headings = getVisiblePageHeadings();
+        const hasConclusionHeading = headings.some(t => t.includes('ket luan'));
+        const hasVisibleConclusionFields =
+            hasVisibleFieldText('phan loai suc khoe') &&
+            hasVisibleFieldText('de nghi');
+        return hasConclusionHeading ||
+            (hasVisibleConclusionFields && !!findVisibleButtonByText('lưu thay đổi'));
     }
 
     function findSidebarItemByText(candidates) {
@@ -1172,7 +1462,12 @@ Tổng ERROR: ${errors.length}`;
             return null;
         }
 
-        const iconSelector = 'i.fa.fa-cog, i[class~="fa-cog"], i[class*="fa-cog"]';
+        const iconSelector = [
+            'i.fa.fa-cog', 'i[class~="fa-cog"]', 'i[class*="fa-cog"]',
+            'i[class~="fa-gear"]', 'i[class*="fa-gear"]',
+            'svg[class*="cog"]', 'svg[class*="gear"]',
+            '[data-icon="cog"]', '[data-icon="gear"]'
+        ].join(',');
 
         // Dùng Array.from thay cho spread NodeList để tránh lỗi iterable trên một số Chromium/Cốc Cốc.
         const icons = Array.from(root.querySelectorAll(iconSelector))
@@ -1189,7 +1484,9 @@ Tổng ERROR: ${errors.length}`;
 
         return buttons.find(btn => {
             try {
-                return !!btn.querySelector(iconSelector);
+                return !!btn.querySelector(iconSelector) ||
+                    btn.classList.contains('btn-kcl-success') ||
+                    /xu ly|thao tac|tuy chon/.test(norm(btn.getAttribute('title') || btn.getAttribute('aria-label') || ''));
             } catch (_) {
                 return false;
             }
@@ -1280,14 +1577,16 @@ Tổng ERROR: ${errors.length}`;
 
     function getVisibleM4EditItems() {
         // Menu ngx-bootstrap được append container="body" nên nằm ngoài <tr>.
-        // Bám vào icon fa-pen + text Chỉnh sửa, không phụ thuộc href tuyệt đối.
-        return [...document.querySelectorAll('a,button,[role="menuitem"]')]
-            .filter(isVisibleElement)
-            .filter(el => {
-                const hasPen = !!el.querySelector('i.fas.fa-pen, i.fa.fa-pen, i[class~="fa-pen"], i[class*="fa-pen"]');
-                const t = norm(el.textContent || '');
-                return hasPen && t.includes('chinh sua');
-            });
+        // Một số bản Medinet đổi class icon nhưng vẫn giữ nhãn “Chỉnh sửa”.
+        // Ưu tiên item trong menu đang mở; chỉ fallback toàn trang khi menu
+        // không có class show/aria-expanded chuẩn.
+        const selector = 'a,button,[role="menuitem"],.dropdown-item';
+        const isEdit = el => isVisibleElement(el) && norm(el.textContent || '').includes('chinh sua');
+        const inOpenMenus = [...document.querySelectorAll(
+            '.dropdown-menu.show, .dropdown-menu[style*="display: block"], [role="menu"]'
+        )].flatMap(menu => [...menu.querySelectorAll(selector)]).filter(isEdit);
+        if (inOpenMenus.length) return [...new Set(inOpenMenus)];
+        return [...document.querySelectorAll(selector)].filter(isEdit);
     }
 
     function pickNearestM4EditItem(items, action) {
@@ -1405,12 +1704,17 @@ Tổng ERROR: ${errors.length}`;
         const buttons = Array.from(document.querySelectorAll(
             'button.dropdown-toggle.btn-kcl-success, ' +
             'button.dropdown-toggle[aria-haspopup="true"], ' +
-            'button.dropdown-toggle'
+            'button.dropdown-toggle, ' +
+            'button.btn-kcl-success'
         )).filter(isVisibleElement);
 
         return buttons.filter(btn => {
             try {
-                return !!btn.querySelector('i.fa-cog, i[class~="fa-cog"], i[class*="fa-cog"]');
+                return btn.classList.contains('btn-kcl-success') || !!btn.querySelector(
+                    'i.fa-cog, i[class~="fa-cog"], i[class*="fa-cog"], ' +
+                    'i[class~="fa-gear"], i[class*="fa-gear"], ' +
+                    'svg[class*="cog"],svg[class*="gear"],[data-icon="cog"],[data-icon="gear"]'
+                );
             } catch (_) {
                 return false;
             }
@@ -1437,7 +1741,22 @@ Tổng ERROR: ${errors.length}`;
             if (parsed && sameCaseIdentity(parsed, c)) return btn;
         }
 
-        // 3) Fallback theo thứ tự row <-> gear button nếu framework tách DOM action khỏi row.
+        // 3) Bảng M4 có thể tách cột Xử lý thành fixed table riêng, nên button
+        // không cùng <tr> với dữ liệu. Ghép theo tâm dọc của dòng trên màn hình.
+        if (row && allGears.length) {
+            const rr = row.getBoundingClientRect();
+            const rowY = rr.top + rr.height / 2;
+            const ranked = allGears
+                .map(btn => {
+                    const br = btn.getBoundingClientRect();
+                    return { btn, distance: Math.abs((br.top + br.height / 2) - rowY) };
+                })
+                .sort((a, b) => a.distance - b.distance);
+            const nearest = ranked[0];
+            if (nearest && nearest.distance <= Math.max(24, rr.height * 0.8)) return nearest.btn;
+        }
+
+        // 4) Fallback cuối theo thứ tự row <-> gear button.
         const candidates = getM4RowCandidates();
         const idx = candidates.findIndex(x => sameCaseIdentity(x.c, c));
         if (idx >= 0 && allGears[idx]) return allGears[idx];
@@ -1526,7 +1845,7 @@ Tổng ERROR: ${errors.length}`;
 
         if (model === 'M4') {
             for (const item of getM4RowCandidates()) {
-                if (isDone(item.c) || isSkipped(item.c)) continue;
+                if (isDone(item.c) || isSkipped(item.c) || isDeferredActive(item.c)) continue;
                 return { link: item.actionCell, c: item.c, row: item.row };
             }
             return null;
@@ -1535,7 +1854,7 @@ Tổng ERROR: ${errors.length}`;
         for (const link of findPencilLinks()) {
             const c = parseCaseFromPencil(link);
             if (!c) continue;
-            if (isDone(c) || isSkipped(c)) continue;
+            if (isDone(c) || isSkipped(c) || isDeferredActive(c)) continue;
             return { link, c };
         }
         return null;
@@ -1544,6 +1863,10 @@ Tổng ERROR: ${errors.length}`;
     function getResultCount() {
         const m = (document.body.innerText || '').match(/Có\s+(\d+)\s+kết quả/i);
         return m ? parseInt(m[1], 10) : null;
+    }
+
+    function getVisibleListCaseCount(model = getCurrentModel()) {
+        return model === 'M4' ? getM4RowCandidates().length : findPencilLinks().length;
     }
 
     // DevExtreme có thể đặt bộ đếm tạm thời về "Có 0 kết quả" trong lúc XHR
@@ -1577,14 +1900,19 @@ Tổng ERROR: ${errors.length}`;
             const model = getCurrentModel();
             const pencils = findPencilLinks().length;
             const rows = getListDataRows().length;
-            const valid = count === 0 || (count > 0 && (model === 'M4' ? getM4RowCandidates().length > 0 : pencils > 0));
+            const visibleCases = model === 'M4' ? getM4RowCandidates().length : pencils;
+            // Medinet đôi lúc tạm báo 0 trong khi grid cũ vẫn còn nguyên. Chỉ
+            // tin số 0 khi không còn dòng/action bệnh nhân nào đang hiển thị.
+            // Nếu bộ đếm chưa render (null) nhưng grid đã có ca thì vẫn có thể
+            // xử lý an toàn dựa trên chính các dòng đang thấy.
+            const valid = count === 0 ? visibleCases === 0 : visibleCases > 0;
             if (!valid) {
                 signature = '';
                 stableSince = 0;
                 return false;
             }
 
-            const nextSignature = `${count}|${model === 'M4' ? rows : pencils}`;
+            const nextSignature = `${count}|${model === 'M4' ? rows : pencils}|${visibleCases}`;
             if (nextSignature !== signature) {
                 signature = nextSignature;
                 stableSince = Date.now();
@@ -1671,6 +1999,8 @@ Tổng ERROR: ${errors.length}`;
             const nodes = [root, ...root.querySelectorAll('a,button,div,span')];
             for (const el of nodes) {
                 if (!el || seen.has(el)) continue;
+                // Số 50/100 trong bộ chọn kích thước trang không phải số trang.
+                if (el.closest?.('.dx-page-sizes,.dx-page-size,[class*="page-size"]')) continue;
                 const txt = (el.textContent || '').trim();
                 if (!/^\d{1,4}$/.test(txt)) continue;
 
@@ -1685,22 +2015,32 @@ Tổng ERROR: ${errors.length}`;
         return out;
     }
 
-    function getCurrentPageNumber() {
-        // Instance của đúng grid đang hiển thị là nguồn ổn định nhất sau khi
-        // bảng đã tải xong. Ưu tiên nó để tránh DOM pager còn giữ số trang cũ.
-        const grid = getListGridInstance();
-        try {
-            const index = Number(grid?.pageIndex?.());
-            if (Number.isFinite(index) && index >= 0) return index + 1;
-        } catch (_) {}
+    function getPagerPageInfo() {
+        const roots = getPagerContainers().filter(isVisibleElement);
+        for (const root of roots) {
+            const text = (root.innerText || root.textContent || '').trim();
+            const m = text.match(/Trang\s+(\d+)\s+trên\s+(\d+)/i);
+            if (m) return { current: Number(m[1]), total: Number(m[2]) };
+        }
 
-        // Dự phòng khi route chưa expose được instance DevExtreme.
+        // Dự phòng đúng chuỗi Medinet: "Trang 4 trên 4 (151 dòng)".
+        const m = (document.body?.innerText || '').match(/Trang\s+(\d+)\s+trên\s+(\d+)/i);
+        return m ? { current: Number(m[1]), total: Number(m[2]) } : null;
+    }
+
+    function getCurrentPageNumber() {
+        // Dòng "Trang X trên Y" đang hiển thị là nguồn mạnh nhất. Instance
+        // DevExtreme có thể còn pageIndex cũ dù bảng đã sang trang khác.
+        const info = getPagerPageInfo();
+        if (info?.current >= 1) return info.current;
+
+        // Dự phòng: chỉ đọc nút trang, loại trừ vùng chọn page-size.
         const explicit = [
             ...document.querySelectorAll(
-                '.dx-page.dx-selection, .dx-page[aria-current="page"], .dx-page-selected, ' +
+                '.dx-pages .dx-page.dx-selection, .dx-pages .dx-page[aria-current="page"], .dx-pages .dx-page-selected, ' +
                 '.pagination .active, [class*="pager"] [aria-current="page"]'
             )
-        ];
+        ].filter(el => !el.closest?.('.dx-page-sizes,.dx-page-size,[class*="page-size"]'));
 
         for (const el of explicit) {
             const n = parseInt((el.textContent || '').trim(), 10);
@@ -1709,6 +2049,12 @@ Tổng ERROR: ${errors.length}`;
 
         const selected = getPagerNumberNodes().find(x => x.selected);
         if (selected?.n) return selected.n;
+
+        const grid = getListGridInstance();
+        try {
+            const index = Number(grid?.pageIndex?.());
+            if (Number.isFinite(index) && index >= 0) return index + 1;
+        } catch (_) {}
 
         return 1;
     }
@@ -1846,6 +2192,11 @@ Tổng ERROR: ${errors.length}`;
     }
 
     function pagerSaysThereMustBeAnotherPage(totalCount, currentPage) {
+        const info = getPagerPageInfo();
+        if (info && Number.isFinite(info.current) && Number.isFinite(info.total)) {
+            return info.current < info.total;
+        }
+
         const grid = getListGridInstance();
 
         // Nguồn mạnh nhất: pageCount thật của DevExtreme.
@@ -1976,6 +2327,113 @@ Tổng ERROR: ${errors.length}`;
         return 'BLOCKED';
     }
 
+    async function goToFirstListPage() {
+        const oldPage = getCurrentPageNumber();
+        if (oldPage <= 1) return true;
+
+        const oldRowsSig = getRenderedRowsSignature();
+        let button = findNumericPageButton(1);
+        if (button) {
+            robustClick(button);
+            const moved = await waitFor(() => {
+                if (isListLoading()) return false;
+                return getCurrentPageNumber() === 1 || getRenderedRowsSignature() !== oldRowsSig;
+            }, 20000, 120);
+            if (moved) return true;
+        }
+
+        const grid = getListGridInstance();
+        try { grid?.pageIndex?.(0); } catch (_) {}
+        return !!await waitFor(() => {
+            if (isListLoading()) return false;
+            return getCurrentPageNumber() === 1 || getRenderedRowsSignature() !== oldRowsSig;
+        }, 20000, 120);
+    }
+
+    async function recoverBlockedPager(model, detail = 'chuyển trang') {
+        const attempt = Number(sessionStorage.getItem(KEY_PAGER_FAILURES) || 0) + 1;
+        sessionStorage.setItem(KEY_PAGER_FAILURES, String(attempt));
+        const delayMs = Math.min(60000, 2000 * (2 ** Math.min(5, attempt - 1)));
+        sessionStorage.setItem(KEY_FORCE_PAGE_ONE, '1');
+        showStatus(
+            `${model} · Medinet chưa ${detail} được · chờ ${Math.ceil(delayMs / 1000)} giây rồi ` +
+            `tự F5/quét lại (lần ${attempt}, không tự dừng)...`
+        );
+        await sleep(delayMs);
+        if (!isActive()) return;
+        await requestSafeReload(`${model}: phục hồi bộ chuyển trang`);
+    }
+
+    function markScanSeen(cases) {
+        const seen = getJson(KEY_SCAN_SEEN, {});
+        for (const c of cases || []) {
+            const key = caseKey(c);
+            if (key) seen[key] = true;
+        }
+        setJson(KEY_SCAN_SEEN, seen);
+        return Object.keys(seen).length;
+    }
+
+    async function refreshAndRestartScan(model, totalCount) {
+        const processed = Number(getStats().processed || 0);
+        const seenCount = Object.keys(getJson(KEY_SCAN_SEEN, {})).length;
+        const state = getJson(KEY_SCAN_RESTART, {
+            lastProcessed: -1, passes: 0, noProgressReloads: 0
+        });
+
+        // Có tiến triển kể từ lần làm mới trước: danh sách có thể đang giữ cache
+        // cũ, nên F5 và quét lại từ trang 1. Nếu một vòng đầy đủ không phát sinh
+        // thêm ca nào thì mới xem xét kết thúc hoặc chờ các ca đang gác.
+        if (Number(state.lastProcessed) === processed) {
+            if (seenCount >= Number(totalCount || 0)) {
+                const deferred = listDeferred(model);
+                if (!deferred.length) return 'COMPLETE';
+
+                if (Number(deferred[0].retryAt || 0) > Date.now()) {
+                    scheduleDeferredWake(model);
+                    return 'WAITING';
+                }
+
+                // Có ca đã tới hạn thử lại: làm mới từ trang 1 để tìm lại dòng,
+                // hoặc handleList sẽ mở thẳng resumeUrl nếu ca đã lưu dở.
+                sessionStorage.removeItem(KEY_SCAN_SEEN);
+                sessionStorage.setItem(KEY_FORCE_PAGE_ONE, '1');
+                showStatus(`${model} · có ca đã đến hạn thử lại · đang tải lại danh sách...`);
+                await sleep(1000);
+                await requestSafeReload(`${model}: mở lại ca đã đến hạn`);
+                return 'RELOADING';
+            }
+
+            const noProgressReloads = Number(state.noProgressReloads || 0) + 1;
+            state.noProgressReloads = noProgressReloads;
+        } else {
+            state.noProgressReloads = 0;
+        }
+
+        setJson(KEY_SCAN_RESTART, {
+            lastProcessed: processed,
+            passes: Number(state.passes || 0) + 1,
+            noProgressReloads: Number(state.noProgressReloads || 0),
+            totalCount,
+            model,
+            time: Date.now()
+        });
+        sessionStorage.removeItem(KEY_SCAN_SEEN);
+        sessionStorage.setItem(KEY_FORCE_PAGE_ONE, '1');
+        const retryPass = Number(state.noProgressReloads || 0);
+        const delayMs = retryPass
+            ? Math.min(60000, 3000 * (2 ** Math.min(4, retryPass - 1)))
+            : 1000;
+        showStatus(
+            `${model} · mới đọc ${seenCount}/${totalCount} ca · chờ ${Math.ceil(delayMs / 1000)} giây, ` +
+            `tự F5 và quét lại từ trang 1 (không tự dừng)...`
+        );
+        await sleep(delayMs);
+        if (!isActive()) return 'WAITING';
+        await requestSafeReload(`${model}: quét lại danh sách từ trang 1`);
+        return 'RELOADING';
+    }
+
     function getCurrentQualityFilterText() {
         const el = findQualityFilterInput();
         return el?.value || '';
@@ -2033,17 +2491,69 @@ Tổng ERROR: ${errors.length}`;
 
     let sheetCache = null;
     let sheetCacheTime = 0;
+    let sheetDateOrderCache = '';
     const SHEET_CACHE_TTL = 2 * 60 * 1000;
+
+    async function fetchTextWithTimeout(url, timeoutMs = 60000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+            const text = await response.text();
+            return { response, text };
+        } finally {
+            clearTimeout(timer);
+        }
+    }
 
     async function fetchSheetRows() {
         if (sheetCache && Date.now() - sheetCacheTime < SHEET_CACHE_TTL) return sheetCache;
-        const res = await fetch(CAN_LAM_SANG_CSV_URL);
-        if (!res.ok) throw new Error(`Không tải được sheet XN (HTTP ${res.status})`);
-        const rows = parseCsv(await res.text());
-        if (!rows.length) throw new Error('Sheet XN rỗng.');
-        sheetCache = { header: rows[0], rows: rows.slice(1) };
-        sheetCacheTime = Date.now();
-        return sheetCache;
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            if (!await waitUntilOnline('tải dữ liệu xét nghiệm')) {
+                throw new Error('AUTO đã dừng trong lúc chờ mạng để tải Sheet XN.');
+            }
+            try {
+                showStatus(`Đang tải Sheet XN${attempt > 1 ? ` · lần ${attempt}/4` : ''}...`);
+                const { response: res, text } = await fetchTextWithTimeout(CAN_LAM_SANG_CSV_URL, 60000);
+                if (!res.ok) {
+                    const error = new Error(`Không tải được Sheet XN (HTTP ${res.status})`);
+                    error.httpStatus = res.status;
+                    throw error;
+                }
+                const rows = parseCsv(text);
+                if (rows.length < 2) throw new Error('Sheet XN rỗng hoặc tải chưa đầy đủ.');
+                const header = rows[0];
+                const required = ['Tên bệnh nhân', 'Ngày XN', 'SID'];
+                const missingHeaders = required.filter(name => colIndex(header, name) < 0);
+                if (missingHeaders.length) {
+                    throw new Error(`Sheet XN tải thiếu cột bắt buộc: ${missingHeaders.join(', ')}.`);
+                }
+                if (sheetCache?.rows?.length && rows.length - 1 < sheetCache.rows.length * 0.8) {
+                    throw new Error(
+                        `Sheet XN có dấu hiệu tải cụt: chỉ ${rows.length - 1}/${sheetCache.rows.length} dòng so với bản trước.`
+                    );
+                }
+                sheetCache = { header: rows[0], rows: rows.slice(1) };
+                sheetCacheTime = Date.now();
+                sheetDateOrderCache = '';
+                touchHeartbeat(`SHEET_OK:${rows.length - 1}`);
+                return sheetCache;
+            } catch (error) {
+                lastError = error;
+                const status = Number(error?.httpStatus || 0);
+                const retryable = !status || status === 408 || status === 429 || status >= 500;
+                if (!retryable || attempt >= 4) break;
+                const waitMs = [2000, 5000, 10000][attempt - 1] || 10000;
+                showStatus(
+                    `Sheet XN tải lỗi/chậm (${error?.name === 'AbortError' ? 'quá 60 giây' : error?.message || error}) · ` +
+                    `chờ ${waitMs / 1000} giây rồi thử lại...`
+                );
+                await sleep(waitMs);
+            }
+        }
+        throw new Error(`Không tải ổn định được Sheet XN sau 4 lần: ${lastError?.message || lastError || 'không rõ lỗi'}`);
     }
 
     function colIndex(header, wanted) {
@@ -2064,12 +2574,73 @@ Tổng ERROR: ${errors.length}`;
         return k ? data[k] : undefined;
     }
 
-    function parseDateDMY(s) {
-        const m = String(s || '').match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
-        if (!m) return null;
-        let y = parseInt(m[3], 10);
+    function buildExpectedClsData(data) {
+        const expected = {};
+        for (const f of FIELD_MAP) {
+            const raw = getData(data, f.column);
+            if (raw !== undefined && raw !== '') expected[f.column] = raw;
+        }
+        const nit = getData(data, 'NIT');
+        if (nit !== undefined && nit !== '') expected.NIT = nit;
+        return expected;
+    }
+
+    function makeStrictDate(year, month, day) {
+        let y = Number(year), m = Number(month), d = Number(day);
         if (y < 100) y += 2000;
-        return new Date(y, parseInt(m[2], 10) - 1, parseInt(m[1], 10));
+        if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return null;
+        if (y < 1900 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+        const date = new Date(y, m - 1, d);
+        // Chặn JavaScript tự cuộn 31/02 thành tháng kế tiếp.
+        if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+        return date;
+    }
+
+    function parseDateByOrder(s, order = 'DMY') {
+        const text = String(s || '').trim();
+        const iso = text.match(/(?:^|\D)(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\D|$)/);
+        if (iso) return makeStrictDate(iso[1], iso[2], iso[3]);
+
+        const m = text.match(/(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?:\D|$)/);
+        if (!m) return null;
+        const first = Number(m[1]), second = Number(m[2]);
+        return order === 'MDY'
+            ? makeStrictDate(m[3], first, second)
+            : makeStrictDate(m[3], second, first);
+    }
+
+    function parseDateDMY(s) {
+        return parseDateByOrder(s, 'DMY');
+    }
+
+    function inferLabDateOrder(rows, dateIndex) {
+        let dmyEvidence = 0;
+        let mdyEvidence = 0;
+        const limit = Math.min(rows.length, 20000);
+
+        for (let i = 0; i < limit; i++) {
+            const text = String(rows[i]?.[dateIndex] || '').trim();
+            if (/\d{4}[\/\-.]\d{1,2}[\/\-.]\d{1,2}/.test(text)) continue;
+            const m = text.match(/(?:^|\D)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?:\D|$)/);
+            if (!m) continue;
+            const first = Number(m[1]), second = Number(m[2]);
+            if (first > 12 && second >= 1 && second <= 12) dmyEvidence++;
+            if (second > 12 && first >= 1 && first <= 12) mdyEvidence++;
+        }
+
+        if (mdyEvidence > dmyEvidence) return 'MDY';
+        return 'DMY';
+    }
+
+    function dateKey(date) {
+        if (!date) return '';
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    }
+
+    function labDateMatchesExam(labDateText, examDateText, labOrder) {
+        const lab = parseDateByOrder(labDateText, labOrder);
+        const exam = parseDateDMY(examDateText);
+        return !!lab && !!exam && dateKey(lab) === dateKey(exam);
     }
 
     function sameDate(a, b) {
@@ -2116,20 +2687,33 @@ Tổng ERROR: ${errors.length}`;
         }
 
         const name = norm(c.hoTen);
+        const labDateOrder = sheetDateOrderCache || inferLabDateOrder(rows, iDate);
+        sheetDateOrderCache = labDateOrder;
+        const expectedSidPrefix = sidPrefixForExamDate(c.ngayKham);
 
         const candidates = [];
         for (const r of rows) {
             if (norm(r[iName]) !== name) continue;
-            if (!sameDate(r[iDate], c.ngayKham)) continue;
+            if (!labDateMatchesExam(r[iDate], c.ngayKham, labDateOrder)) continue;
+
+            // Nếu SID có cấu trúc ngày DDMMYY- thì dùng làm lớp kiểm tra thứ hai.
+            // SID không mang prefix ngày vẫn được chấp nhận, không tự suy đoán.
+            const sid = String(r[iSid] || '').trim();
+            if (/^\d{6}-/.test(sid) && expectedSidPrefix && !sid.startsWith(expectedSidPrefix)) continue;
+
             candidates.push({
                 data: buildData(header, r),
+                labDate: String(r[iDate] || '').trim(),
                 age: iAge >= 0 ? String(r[iAge] || '').trim() : '',
                 sex: iSex >= 0 ? String(r[iSex] || '').trim() : ''
             });
         }
 
         if (candidates.length === 0) return { status: 'NOT_FOUND', matches: [] };
-        if (candidates.length === 1) return { status: 'OK', data: candidates[0].data };
+        if (candidates.length === 1) return {
+            status: 'OK', data: candidates[0].data,
+            labDate: candidates[0].labDate, labDateOrder
+        };
 
         // Chỉ dùng năm sinh/tuổi và giới để GỠ TRÙNG, không dùng ở bước tìm chính.
         // Sheet hiện có dòng ghi "1993 tuổi": số 1900–2100 được hiểu là năm sinh;
@@ -2155,7 +2739,10 @@ Tổng ERROR: ${errors.length}`;
             if (bySex.length) narrowed = bySex;
         }
 
-        if (narrowed.length === 1) return { status: 'OK', data: narrowed[0].data };
+        if (narrowed.length === 1) return {
+            status: 'OK', data: narrowed[0].data,
+            labDate: narrowed[0].labDate, labDateOrder
+        };
         return { status: 'DUPLICATE', matches: narrowed.map(x => x.data) };
     }
 
@@ -2435,23 +3022,145 @@ Tổng ERROR: ${errors.length}`;
         }
     }
 
+    function isNegativeUrineValue(raw) {
+        const text = norm(raw);
+        const n = parseNumberLoose(raw);
+        return (Number.isFinite(n) && n === 0) ||
+            ['negative', 'neg', 'am tinh', 'binh thuong'].includes(text);
+    }
+
+    function isNegativeDisplayedValue(raw) {
+        const shown = norm(raw);
+        return shown.includes('negative') || shown.includes('am tinh');
+    }
+
+    function getAngularControlComponent(input) {
+        const ng = window.ng;
+        if (!ng || !input) return null;
+        const nodes = [
+            input.closest?.('hnumberbox'),
+            input.closest?.('dx-number-box'),
+            input.closest?.('.dx-numberbox'),
+            input.parentElement,
+            input
+        ].filter(Boolean);
+        for (const node of nodes) {
+            try {
+                const component = ng.getComponent?.(node) || ng.getOwningComponent?.(node);
+                if (component) return component;
+            } catch (_) {}
+        }
+        return null;
+    }
+
+    function pushNegativeIntoAngularModel(input) {
+        const value = 'Negative';
+        const component = getAngularControlComponent(input);
+        if (!component) return false;
+        let touched = false;
+
+        // hnumberbox là ControlValueAccessor tùy biến. Ghi cả view value và
+        // callback model để Angular đưa đúng chuỗi Negative vào payload Lưu.
+        for (const prop of ['value', 'model', 'ngModel', 'inputValue']) {
+            try {
+                if (prop in component) {
+                    component[prop] = value;
+                    touched = true;
+                }
+            } catch (_) {}
+        }
+        for (const method of ['writeValue', 'onChange', '_onChange', 'propagateChange']) {
+            try {
+                if (typeof component[method] === 'function') {
+                    component[method](value);
+                    touched = true;
+                }
+            } catch (_) {}
+        }
+        for (const emitter of ['valueChange', 'modelChange', 'ngModelChange', 'change']) {
+            try {
+                if (typeof component[emitter]?.emit === 'function') {
+                    component[emitter].emit(value);
+                    touched = true;
+                }
+            } catch (_) {}
+        }
+        try { component.changeDetectorRef?.detectChanges?.(); } catch (_) {}
+        try { component.cdr?.detectChanges?.(); } catch (_) {}
+        return touched;
+    }
+
+    async function typeNegativeLikeUser(input) {
+        input.focus();
+        try { input.select(); } catch (_) {}
+        nativeInputSetter.call(input, '');
+        input.dispatchEvent(new InputEvent('input', {
+            bubbles: true, inputType: 'deleteContentBackward', data: null
+        }));
+
+        let current = '';
+        for (const ch of 'Negative') {
+            input.dispatchEvent(new KeyboardEvent('keydown', {
+                bubbles: true, cancelable: true, key: ch
+            }));
+            input.dispatchEvent(new InputEvent('beforeinput', {
+                bubbles: true, cancelable: true, inputType: 'insertText', data: ch
+            }));
+            current += ch;
+            nativeInputSetter.call(input, current);
+            input.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText', data: ch
+            }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch }));
+        }
+        pushNegativeIntoAngularModel(input);
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.blur();
+        input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+        await sleep(180);
+        return isNegativeDisplayedValue(input.value || '');
+    }
+
+    async function setNegativeQualitative(inputInfo) {
+        const input = inputInfo?.element;
+        if (!input) return '';
+        const isNegativeDisplay = () => isNegativeDisplayedValue(input.value || '');
+
+        CLS_WRITES.pending++;
+        try {
+            // Không ghi model = 0: hnumberbox của Medinet coi 0 là rỗng khi
+            // serialize. Gõ từng ký tự như người dùng và đẩy chuỗi Negative
+            // qua ControlValueAccessor/Angular model nếu runtime cho phép.
+            await typeNegativeLikeUser(input);
+            if (!isNegativeDisplay()) {
+                pushNegativeIntoAngularModel(input);
+                nativeInputSetter.call(input, 'Negative');
+                input.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertText', data: 'Negative'
+                }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                await sleep(120);
+            }
+
+            const host = input.closest?.('hnumberbox,.dx-numberbox,dx-number-box');
+            for (const hidden of host?.querySelectorAll?.('input[type="hidden"]') || []) {
+                hidden.value = 'Negative';
+                hidden.dispatchEvent(new Event('input', { bubbles: true }));
+                hidden.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            return isNegativeDisplay() ? input.value : '';
+        } finally {
+            CLS_WRITES.pending = Math.max(0, CLS_WRITES.pending - 1);
+            CLS_WRITES.completed++;
+            CLS_WRITES.lastCompletedAt = Date.now();
+        }
+    }
+
     async function setQualitative(inputInfo, raw) {
-        // Giữ đúng nguyên cơ chế Auto KSKTD: với nhóm định tính niệu, thử
-        // "Negative" khi giá trị nguồn = 0. Nếu control không nhận chữ
-        // (NumberBox kiểu cũ) thì tự rơi về số 0.
         const val = String(raw ?? '').trim();
         if (!val) return '';
 
-        const n = parseNumberLoose(val);
-        if (Number.isFinite(n) && n === 0) {
-            await setCommittedEditorValue(inputInfo.element, 'Negative', 'Negative');
-            // Một số control hiển thị Negative thoáng qua rồi Angular loại bỏ.
-            // Chờ đủ lâu để phân biệt đã commit thật với giá trị tạm trên input.
-            await sleep(350);
-            const displayed = (inputInfo.element.value || '').trim();
-            if (norm(displayed).includes('negative')) return 'Negative';
-            return await setNumberValue(inputInfo.element, '0');
-        }
+        if (isNegativeUrineValue(val)) return await setNegativeQualitative(inputInfo);
 
         return await setNumberValue(inputInfo.element, val);
     }
@@ -2501,7 +3210,8 @@ Tổng ERROR: ${errors.length}`;
         const raw = getData(data, 'NIT');
         if (raw === undefined || raw === '') return { filled: false, missing: true };
         const answer = String(raw).trim() === '0' ? 'âm tính' : 'dương tính';
-        const labels = findLabelElements('Nitrit').filter(el => isInScope(el, scope));
+        const labels = findLabelElements('Nitrit')
+            .filter(el => isInScope(el, scope) && isVisibleElement(el));
         if (!labels.length) return { filled: false, notFound: true };
         const radio = findRadioNearLabel(labels[0], answer);
         if (!radio) return { filled: false, notFound: true };
@@ -2548,8 +3258,9 @@ Tổng ERROR: ${errors.length}`;
                 const raw = getData(data, f.column);
                 if (raw === undefined || raw === '') continue;
                 const labels = f.column === 'Glucose'
-                    ? findBloodGlucoseLabelElements(scope)
-                    : findLabelElements(f.label).filter(el => isInScope(el, scope));
+                    ? findBloodGlucoseLabelElements(scope).filter(isVisibleElement)
+                    : findLabelElements(f.label)
+                        .filter(el => isInScope(el, scope) && isVisibleElement(el));
                 const label = labels[0] || null;
                 const input = label ? findNumberInputForLabel(label)?.element : null;
                 if (!input || !input.isConnected || !isVisibleElement(input) || input.disabled) {
@@ -2561,7 +3272,8 @@ Tổng ERROR: ${errors.length}`;
 
             const nitRaw = getData(data, 'NIT');
             if (nitRaw !== undefined && nitRaw !== '') {
-                const nitLabel = findLabelElements('Nitrit').find(el => isInScope(el, scope));
+                const nitLabel = findLabelElements('Nitrit')
+                    .find(el => isInScope(el, scope) && isVisibleElement(el));
                 const answer = String(nitRaw).trim() === '0' ? 'âm tính' : 'dương tính';
                 const radio = nitLabel ? findRadioNearLabel(nitLabel, answer) : null;
                 if (!radio || !radio.isConnected || !isVisibleElement(radio) || radio.getAttribute('aria-disabled') === 'true') {
@@ -2587,22 +3299,34 @@ Tổng ERROR: ${errors.length}`;
         return { ok: false, hidden: false, missing: lastMissing };
     }
 
-    async function waitForClsWritesFinished(timeoutMs = 15000) {
+    async function waitForClsWritesFinished(timeoutMs = 90000, quietMs = 200) {
         const startedAt = Date.now();
+        let quietSince = 0;
         while (Date.now() - startedAt < timeoutMs) {
             if (document.hidden) return false;
-            const quietFor = Date.now() - Number(CLS_WRITES.lastCompletedAt || 0);
-            if (CLS_WRITES.pending === 0 && CLS_WRITES.completed > 0 && quietFor >= 700 && !isListLoading()) {
-                return true;
+            const ready =
+                CLS_WRITES.pending === 0 &&
+                CLS_WRITES.completed > 0 &&
+                !isListLoading() &&
+                !hasPendingClsNetwork(startedAt - 10000);
+
+            if (ready) {
+                if (!quietSince) quietSince = Date.now();
+                const quietFor = Date.now() - quietSince;
+                showStatus(`Đang đồng bộ CLS · hệ thống yên ${(quietFor / 1000).toFixed(1)} giây...`);
+                if (quietFor >= quietMs) return true;
+            } else {
+                quietSince = 0;
             }
             await sleep(100);
         }
         return false;
     }
 
-    async function waitForFilledClsValuesStable(scope, data, stableMs = 1500, timeoutMs = 30000) {
-        // Chỉ quan sát, tuyệt đối không điền lại. Các ô có dữ liệu nguồn chỉ cần
-        // không trống và toàn bộ trạng thái hiển thị không đổi trong stableMs.
+    async function waitForFilledClsValuesStable(scope, data, quietMs = 250, timeoutMs = 90000) {
+        // Không ngủ một khoảng cố định. Đồng hồ "yên" chỉ chạy khi toàn bộ ô,
+        // widget, network và loading đều ổn; bất kỳ thay đổi/render lại nào
+        // cũng đặt đồng hồ về 0. Mạng chậm thì tự chờ lâu hơn, mạng nhanh đi tiếp.
         const startedAt = Date.now();
         let stableSince = 0;
         let lastUnstable = [];
@@ -2617,21 +3341,35 @@ Tổng ERROR: ${errors.length}`;
                 const raw = getData(data, f.column);
                 if (raw === undefined || raw === '') continue;
                 const labels = f.column === 'Glucose'
-                    ? findBloodGlucoseLabelElements(scope)
-                    : findLabelElements(f.label).filter(el => isInScope(el, scope));
+                    ? findBloodGlucoseLabelElements(scope).filter(isVisibleElement)
+                    : findLabelElements(f.label)
+                        .filter(el => isInScope(el, scope) && isVisibleElement(el));
                 const label = labels[0] || null;
                 const input = label ? findNumberInputForLabel(label)?.element : null;
                 const displayed = String(input?.value ?? '').trim();
-                if (!input || !input.isConnected || !displayed) {
+                const editor = input ? getDevExtremeEditor(input) : null;
+                const widgetValue = editor?.instance?.option
+                    ? editor.instance.option('value')
+                    : displayed;
+                const widgetHasValue = widgetValue !== null && widgetValue !== undefined && String(widgetValue).trim() !== '';
+                const requiresNegativeText =
+                    QUALITATIVE_URINE_COLUMNS.includes(f.column) &&
+                    isNegativeUrineValue(raw);
+                if (
+                    !input || !input.isConnected || !isVisibleElement(input) ||
+                    !displayed || !widgetHasValue ||
+                    (requiresNegativeText && !isNegativeDisplayedValue(displayed))
+                ) {
                     unstable.push(f.label);
                 } else {
-                    signatureParts.push(`${f.column}:${displayed}`);
+                    signatureParts.push(`${f.column}:${getClsControlId(input)}:${displayed}:${String(widgetValue)}`);
                 }
             }
 
             const nitRaw = getData(data, 'NIT');
             if (nitRaw !== undefined && nitRaw !== '') {
-                const nitLabel = findLabelElements('Nitrit').find(el => isInScope(el, scope));
+                const nitLabel = findLabelElements('Nitrit')
+                    .find(el => isInScope(el, scope) && isVisibleElement(el));
                 const answer = String(nitRaw).trim() === '0' ? 'âm tính' : 'dương tính';
                 const radio = nitLabel ? findRadioNearLabel(nitLabel, answer) : null;
                 const selected = isRadioSelected(radio);
@@ -2640,16 +3378,22 @@ Tổng ERROR: ${errors.length}`;
             }
 
             const signature = signatureParts.join('|');
-            if (unstable.length === 0 && !isListLoading()) {
+            const loading = isListLoading();
+            const networkPending = hasPendingClsNetwork(startedAt - 10000);
+            if (unstable.length === 0 && !loading && !networkPending) {
                 if (!stableSince || signature !== lastSignature) stableSince = Date.now();
                 lastSignature = signature;
                 const stableFor = Date.now() - stableSince;
-                showStatus(`CLS đã đầy đủ · chờ yên ${(stableFor / 1000).toFixed(1)}/${(stableMs / 1000).toFixed(1)} giây...`);
-                if (stableFor >= stableMs) return { ok: true, hidden: false, unstable: [] };
+                showStatus(`CLS đã đủ · đang xác nhận hệ thống yên ${(stableFor / 1000).toFixed(1)} giây...`);
+                if (stableFor >= quietMs) return { ok: true, hidden: false, unstable: [] };
             } else {
                 stableSince = 0;
                 lastSignature = '';
-                if (unstable.length) showStatus(`CLS còn đang hoàn tất: ${unstable.join(', ')}...`);
+                if (unstable.length) {
+                    showStatus(`CLS còn đang hoàn tất: ${unstable.join(', ')}...`);
+                } else if (loading || networkPending) {
+                    showStatus('Medinet còn đang tải/đồng bộ CLS · tiếp tục chờ...');
+                }
             }
             lastUnstable = unstable;
             await sleep(100);
@@ -2695,8 +3439,9 @@ Tổng ERROR: ${errors.length}`;
         for (const f of FIELD_MAP) {
             if (document.hidden) throw new Error('TAB_HIDDEN: tạm dừng điền CLS.');
             const labels = f.column === 'Glucose'
-                ? findBloodGlucoseLabelElements(scope)
-                : findLabelElements(f.label).filter(el => isInScope(el, scope));
+                ? findBloodGlucoseLabelElements(scope).filter(isVisibleElement)
+                : findLabelElements(f.label)
+                    .filter(el => isInScope(el, scope) && isVisibleElement(el));
             if (!labels.length) { notFound.push(f.label); continue; }
             const info = findNumberInputForLabel(labels[0]);
             if (!info) { notFound.push(f.label); continue; }
@@ -2750,6 +3495,14 @@ Tổng ERROR: ${errors.length}`;
     async function saveCurrentPage(label) {
         showStatus(`Đang ${label}...`);
 
+        const normalizedLabel = norm(label);
+        const pageCheck = normalizedLabel.includes('can lam sang')
+            ? isClsPage
+            : (normalizedLabel.includes('ket luan') ? isConclusionPage : null);
+        if (pageCheck && !pageCheck()) {
+            throw new Error(`${label}: đang không ở đúng trang nên không bấm Lưu.`);
+        }
+
         // Cùng fastClick của Auto KL M2, nhưng giới hạn vào nút ĐANG HIỂN THỊ.
         // SPA Medinet có thể giữ DOM trang CLS cũ khi đang chuyển sang Kết luận.
         const btn = await waitFor(
@@ -2759,6 +3512,9 @@ Tổng ERROR: ${errors.length}`;
         );
         if (!btn) {
             throw new Error(`${label}: không tìm thấy nút Lưu đang hiển thị.`);
+        }
+        if (pageCheck && !pageCheck()) {
+            throw new Error(`${label}: trang đã thay đổi trước khi bấm Lưu.`);
         }
 
         const marker = NET.seq;
@@ -2779,9 +3535,9 @@ Tổng ERROR: ${errors.length}`;
         };
     }
 
-    // Sau khi Lưu CLS, Medinet có thể reload toàn trang hoặc chỉ render lại
-    // khung Angular. Không chuyển mục ngay khi request vừa xong: phải chờ
-    // trang CLS hiện lại đầy đủ và giữ nguyên trạng thái liên tục.
+    // Sau khi Lưu CLS, Medinet có thể reload toàn trang, render lại khung
+    // Angular hoặc tự trả về tab Thông tin hành chính. Phải chờ hồ sơ ổn định
+    // rồi mới mở Kết luận; không được bắt buộc phải quay lại đúng tab CLS.
     function getClsReloadSnapshot() {
         if (document.readyState !== 'complete' || !isClsPage() || isListLoading()) return null;
 
@@ -2798,6 +3554,32 @@ Tổng ERROR: ${errors.length}`;
         return `${location.href}|${inputs.length}|${values}`;
     }
 
+    function getDetailShellSnapshot() {
+        if (document.readyState !== 'complete' || isListPage() || isListLoading()) return null;
+
+        // Tab Hành chính sau full reload vẫn là đúng hồ sơ nếu sidebar của hồ
+        // sơ đã có đủ mục CLS và Kết luận. Đây là tín hiệu an toàn để tiếp tục.
+        const clsItem = findSidebarItemByText(['Khám cận lâm sàng', 'Cận lâm sàng']);
+        const conclusionItem = findSidebarItemByText(['Kết luận', 'Kết luận khám']);
+        if (!clsItem || !conclusionItem) return null;
+
+        const body = norm(document.body?.innerText || '');
+        const title = norm((document.querySelector('h2.hidden-web-title,.hidden-web-title,h1,h2') || {}).textContent || '');
+        const isAdministrativeTab =
+            body.includes('thong tin hanh chinh') ||
+            title.includes('thong tin hanh chinh') ||
+            (body.includes('dinh danh ca nhan') && body.includes('ngay sinh'));
+
+        // Chấp nhận cả tab Hành chính và các tab con khác trong đúng hồ sơ;
+        // tuyệt đối không chấp nhận trang danh sách.
+        if (!isAdministrativeTab && !isClsPage() && !isConclusionPage()) {
+            const hasVisibleSave = !!findVisibleButtonByText('lưu thay đổi');
+            if (!hasVisibleSave) return null;
+        }
+
+        return `${location.href}|${title}|${isAdministrativeTab ? 'ADMIN' : 'DETAIL'}`;
+    }
+
     async function waitForClsReloadSettled(c, timeoutMs = 30000, stableMs = 2000) {
         const startedAt = Date.now();
         let signature = '';
@@ -2807,7 +3589,9 @@ Tổng ERROR: ${errors.length}`;
             if (document.hidden) return { ok: false, hidden: true };
             if (isConclusionPage()) return { ok: true, alreadyConclusion: true };
 
-            const next = getClsReloadSnapshot();
+            const clsSnapshot = getClsReloadSnapshot();
+            const detailSnapshot = clsSnapshot ? null : getDetailShellSnapshot();
+            const next = clsSnapshot || detailSnapshot;
             if (!next) {
                 signature = '';
                 stableSince = 0;
@@ -2817,7 +3601,8 @@ Tổng ERROR: ${errors.length}`;
             } else if (Date.now() - stableSince >= stableMs) {
                 return {
                     ok: true,
-                    fullReload: !!c?.clsSavePageInstance && c.clsSavePageInstance !== PAGE_INSTANCE_ID
+                    fullReload: !!c?.clsSavePageInstance && c.clsSavePageInstance !== PAGE_INSTANCE_ID,
+                    landedOnDetailShell: !clsSnapshot
                 };
             }
             await sleep(150);
@@ -2844,6 +3629,7 @@ Tổng ERROR: ${errors.length}`;
     async function skipCurrent(reason, type) {
         const c = getCase();
         warn('SKIP:', c, reason);
+        removeDeferred(c);
         await addSkipped(c, reason, type);
         setStage(STAGE.RETURN_LIST);
         if (!isListPage()) await goBackToList();
@@ -2857,47 +3643,77 @@ Tổng ERROR: ${errors.length}`;
         const c = getCase();
         const stage = getStage();
 
-        // Lỗi của một ca không được dừng cả batch. Thử lại tại chỗ 2 lần;
-        // nếu vẫn lỗi thì ghi nhận + bỏ qua ca để tiếp tục ca kế tiếp.
-        if (stage === STAGE.SAVE_CLS || stage === STAGE.SAVE_CONCLUSION) {
-            const n = incRetry(c || {}, stage);
-            if (n <= 2) {
-                const s = getStats();
-                s.retries = (s.retries || 0) + 1;
-                saveStats(s);
-                showStatus(`Lỗi lưu tạm thời · thử lại ${n}/2: ${reason}`);
-                await sleep(700);
-                queueRun();
-                return;
-            }
-            await addError(c, `${stage}: ${reason}`);
-            if (c) await addSkipped(c, `Lỗi lưu sau 2 lần thử: ${stage} - ${reason}`, 'INVALID');
-            setStage(STAGE.RETURN_LIST);
-            if (!isListPage()) await goBackToList();
-                setCase(null);
-            setStage(STAGE.LIST);
-            queueRun(500);
-            return;
-        }
-
-        const n = incRetry(c || {}, stage);
-        warn(`ERROR stage=${stage} retry=${n}`, reason);
-        if (n <= 2) {
+        // Lỗi cấp trang khi chưa có ca: tự chờ/F5 vô hạn, không tắt batch.
+        if (!c) {
+            const n = incRetry({}, stage);
+            const delayMs = Math.min(60000, 2000 * (2 ** Math.min(5, n - 1)));
             const s = getStats();
             s.retries = (s.retries || 0) + 1;
             saveStats(s);
-            showStatus(`Lỗi tạm thời (${stage}) - thử lại ${n}/2: ${reason}`);
-            await sleep(1200);
+            showStatus(
+                `Lỗi tải ${stage} · chờ ${Math.ceil(delayMs / 1000)} giây rồi tự thử lại ` +
+                `(lần ${n}, không tự dừng): ${reason}`
+            );
+            await sleep(delayMs);
+            if (!isActive()) return;
+            if (!isListPage() && n >= 3) {
+                const listUrl = sessionStorage.getItem(KEY_LIST_URL);
+                if (listUrl) {
+                    setStage(STAGE.LIST);
+                    location.href = listUrl;
+                    return;
+                }
+            }
+            await requestSafeReload(`phục hồi lỗi ${stage}`);
+            return;
+        }
+
+        const n = incRetry(c, stage);
+        warn(`ERROR stage=${stage} retry=${n}`, reason);
+        const s = getStats();
+        s.retries = (s.retries || 0) + 1;
+        saveStats(s);
+
+        // Thử nhanh tại chỗ hai lần. Sau đó gác ca với cooldown để auto làm
+        // ca khác; ca gác sẽ tự quay lại, không bị biến thành SKIP vĩnh viễn.
+        if (n <= 2) {
+            const delayMs = n === 1 ? 1500 : 4000;
+            showStatus(`Lỗi tạm thời (${stage}) · chờ ${delayMs / 1000} giây, thử nhanh ${n}/2: ${reason}`);
+            await sleep(delayMs);
             queueRun();
             return;
         }
-        await addError(c, `${stage}: ${reason}`);
-        if (c) await addSkipped(c, `Lỗi sau 2 lần thử: ${stage} - ${reason}`, 'INVALID');
-        setStage(STAGE.RETURN_LIST);
-        if (!isListPage()) await goBackToList();
+
+        clearRetry(c, stage);
+        await addError(c, `TẠM GÁC ${stage}: ${reason}`);
+        const deferred = saveDeferred(c, stage, reason);
+        const waitMinutes = Math.max(1, Math.ceil((Number(deferred?.retryAt || 0) - Date.now()) / 60000));
+        showStatus(
+            `Tạm gác ${c.hoTen || c.cccd || 'ca hiện tại'} khoảng ${waitMinutes} phút; ` +
+            `đang quay lại danh sách làm ca khác...`
+        );
+
+        if (!isListPage()) {
+            const back = await goBackToList();
+            if (!back) {
+                const listUrl = sessionStorage.getItem(KEY_LIST_URL);
+                if (listUrl) {
+                    setCase(null);
+                    setStage(STAGE.LIST);
+                    location.href = listUrl;
+                    return;
+                }
+                // Chưa có URL danh sách: giữ hồ sơ và tự thử lại, không dừng.
+                removeDeferred(c);
+                setCase(c);
+                setStage(stage);
+                queueRun(30000);
+                return;
+            }
+        }
         setCase(null);
         setStage(STAGE.LIST);
-        queueRun();
+        queueRun(300);
     }
 
     // =====================================================================
@@ -2906,6 +3722,7 @@ Tổng ERROR: ${errors.length}`;
 
     async function handleList() {
         const modelNow = getCurrentModel();
+        if (isListPage()) sessionStorage.setItem(KEY_LIST_URL, location.href);
         showStatus(`Đang chờ Medinet tải xong danh sách ${modelNow || ''}...`);
 
         const pageReady = await waitForPageReadyOrReload(
@@ -2915,12 +3732,36 @@ Tổng ERROR: ${errors.length}`;
         );
         if (!pageReady) return;
 
+        if (sessionStorage.getItem(KEY_FORCE_PAGE_ONE) === '1') {
+            showStatus('Danh sách đã làm mới · đang quay về trang 1 để quét tiếp...');
+            const atFirst = await goToFirstListPage();
+            if (!atFirst) {
+                await recoverBlockedPager(modelNow, 'quay về trang 1');
+                return;
+            }
+            sessionStorage.removeItem(KEY_PAGER_FAILURES);
+            sessionStorage.removeItem(KEY_FORCE_PAGE_ONE);
+            queueRun(200);
+            return;
+        }
+
+        if (resumeDueDeferredFromList()) return;
+
         let resultCount = getResultCount();
         showStatus(`Danh sách thiếu CLS${resultCount !== null ? `: ${resultCount} kết quả` : ''} · Trang ${getCurrentPageNumber()}`);
 
         if (resultCount === 0) {
             if (isListLoading()) {
                 queueRun(500);
+                return;
+            }
+            if (getVisibleListCaseCount(modelNow) > 0) {
+                showStatus('Bộ đếm đang báo 0 nhưng bảng vẫn còn ca · chưa kết thúc, đang chờ Medinet đồng bộ...');
+                queueRun(700);
+                return;
+            }
+            if (listDeferred(modelNow).length) {
+                scheduleDeferredWake(modelNow);
                 return;
             }
             finishBatch('Filter đã còn 0 kết quả.');
@@ -2938,6 +3779,15 @@ Tổng ERROR: ${errors.length}`;
             }
 
             if (resultCount === 0) {
+                if (getVisibleListCaseCount('M4') > 0) {
+                    showStatus('M4: bộ đếm báo 0 nhưng bảng vẫn còn ca · tiếp tục chờ đồng bộ...');
+                    queueRun(700);
+                    return;
+                }
+                if (listDeferred('M4').length) {
+                    scheduleDeferredWake('M4');
+                    return;
+                }
                 finishBatch('Filter đã còn 0 kết quả.');
                 return;
             }
@@ -2946,8 +3796,12 @@ Tổng ERROR: ${errors.length}`;
                 throw new Error(`M4: bảng báo ${resultCount} kết quả nhưng chưa đọc được dòng bệnh nhân.`);
             }
 
-            const found = rows.find(x => !isDone(x.c) && !isSkipped(x.c)) || null;
+            markScanSeen(rows.map(x => x.c));
+            const found = rows.find(x =>
+                !isDone(x.c) && !isSkipped(x.c) && !isDeferredActive(x.c)
+            ) || null;
             if (found) {
+                found.c = prepareDeferredCase(found.c);
                 found.c.startedAt = Date.now();
                 setCase(found.c);
                 setStage(STAGE.OPENING_CASE);
@@ -2964,16 +3818,18 @@ Tổng ERROR: ${errors.length}`;
 
             const pageMoveM4 = await goNextPageIfPossible(resultCount);
             if (pageMoveM4 === 'MOVED') {
+                sessionStorage.removeItem(KEY_PAGER_FAILURES);
                 queueRun(120);
                 return;
             }
             if (pageMoveM4 === 'BLOCKED') {
-                showStatus(`M4 · còn trang kế nhưng Medinet chưa chuyển trang được · đang thử lại...`);
-                queueRun(1200);
+                await recoverBlockedPager('M4');
                 return;
             }
 
-            finishBatch('Đã quét hết trang cuối M4; chỉ còn ca đã SKIP/DONE hoặc không còn ca thiếu CLS.');
+            const scanResultM4 = await refreshAndRestartScan('M4', resultCount);
+            if (scanResultM4 === 'RELOADING' || scanResultM4 === 'WAITING') return;
+            finishBatch('Đã làm mới và quét lại toàn bộ M4 nhưng không phát sinh thêm ca có thể xử lý.');
             return;
         }
 
@@ -2992,9 +3848,13 @@ Tổng ERROR: ${errors.length}`;
         const parsedCases = pencilLinks
             .map(link => ({ link, c: parseCaseFromPencil(link) }))
             .filter(x => x.c);
-        const found = parsedCases.find(candidate => !isDone(candidate.c) && !isSkipped(candidate.c)) || null;
+        markScanSeen(parsedCases.map(x => x.c));
+        const found = parsedCases.find(candidate =>
+            !isDone(candidate.c) && !isSkipped(candidate.c) && !isDeferredActive(candidate.c)
+        ) || null;
 
         if (found) {
+            found.c = prepareDeferredCase(found.c);
             found.c.startedAt = Date.now();
             setCase(found.c);
             setStage(STAGE.OPENING_CASE);
@@ -3021,16 +3881,18 @@ Tổng ERROR: ${errors.length}`;
 
         const pageMoveM3 = await goNextPageIfPossible(resultCount);
         if (pageMoveM3 === 'MOVED') {
+            sessionStorage.removeItem(KEY_PAGER_FAILURES);
             queueRun(120);
             return;
         }
         if (pageMoveM3 === 'BLOCKED') {
-            showStatus(`M3 · còn trang kế nhưng Medinet chưa chuyển trang được · đang thử lại...`);
-            queueRun(1200);
+            await recoverBlockedPager('M3');
             return;
         }
 
-        finishBatch('Đã quét hết trang cuối M3; chỉ còn ca đã SKIP/DONE hoặc không còn ca thiếu CLS.');
+        const scanResultM3 = await refreshAndRestartScan('M3', resultCount);
+        if (scanResultM3 === 'RELOADING' || scanResultM3 === 'WAITING') return;
+        finishBatch('Đã làm mới và quét lại toàn bộ M3 nhưng không phát sinh thêm ca có thể xử lý.');
     }
 
 
@@ -3051,7 +3913,7 @@ Tổng ERROR: ${errors.length}`;
 
         if (c.model === 'M4') {
             showStatus(`M4 · mở lại hồ sơ: ${c.hoTen} · ${c.cccd || ''}`);
-            const found = findM4RowForCase(c);
+            const found = getM4RowCandidates().find(x => sameCaseIdentity(x.c, c)) || null;
             if (!found) {
                 throw new Error(`M4: không tìm lại được dòng của ${c.hoTen} trên danh sách.`);
             }
@@ -3079,6 +3941,11 @@ Tổng ERROR: ${errors.length}`;
     }
 
     async function handleOpenCls() {
+        const current = getCase();
+        if (current && !isListPage()) {
+            current.detailUrl = location.href;
+            setCase(current);
+        }
         if (isClsPage()) {
             setStage(STAGE.FILL_CLS);
             queueRun();
@@ -3121,9 +3988,25 @@ Tổng ERROR: ${errors.length}`;
             return;
         }
 
+        // Lớp chặn cuối ngay trước khi điền: dù logic tìm phía trên có thay đổi
+        // hoặc dữ liệu sheet vừa refresh, tên và ngày vẫn phải khớp tuyệt đối.
+        const matchedName = getData(match.data, 'Tên bệnh nhân');
+        const matchedDate = getData(match.data, 'Ngày XN');
+        if (
+            norm(matchedName) !== norm(c.hoTen) ||
+            !labDateMatchesExam(matchedDate, c.ngayKham, match.labDateOrder)
+        ) {
+            await skipCurrent(
+                `Chặn điền sai XN: hồ sơ ${c.hoTen} · khám ${c.ngayKham}; dữ liệu tìm được ${matchedName || '?'} · XN ${matchedDate || '?'}.`,
+                'INVALID'
+            );
+            return;
+        }
+
         const report = await fillCls(match.data);
         c.sid = report.sid;
         c.fillReport = report;
+        c.clsExpectedData = buildExpectedClsData(match.data);
         setCase(c);
         setStage(STAGE.SAVE_CLS);
         queueRun();
@@ -3132,6 +4015,15 @@ Tổng ERROR: ${errors.length}`;
     async function handleSaveCls() {
         const c = getCase();
         if (!c) throw new Error('Mất thông tin ca trước khi lưu CLS.');
+        if (!isClsPage()) {
+            // Tuyệt đối không bấm nhầm nút Lưu thay đổi của tab Hành chính.
+            c.clsSaveVerifiedOnCls = false;
+            setCase(c);
+            setStage(STAGE.OPEN_CLS);
+            showStatus('Chưa ở đúng tab CLS · đang mở lại Khám cận lâm sàng...');
+            queueRun();
+            return;
+        }
         if (document.hidden) {
             showStatus('Tab đang ẩn · chưa lưu CLS...');
             queueRun(1000);
@@ -3141,17 +4033,34 @@ Tổng ERROR: ${errors.length}`;
         if (c.noLab) {
             showStatus('Không có XN · chuẩn bị lưu Cận lâm sàng trống...');
         } else {
-            showStatus('CLS đã đầy đủ và đứng yên · chuẩn bị lưu Cận lâm sàng...');
-            const writesFinished = await waitForClsWritesFinished();
-            if (!writesFinished) {
-                showStatus('Tab đang ẩn hoặc lệnh điền chưa hoàn tất · chưa bấm Lưu...');
-                queueRun(1000);
+            showStatus('Đang kiểm tra lần cuối toàn bộ CLS trước khi lưu...');
+            const expected = c.clsExpectedData || {};
+            if (Object.keys(expected).length < 5) {
+                setStage(STAGE.FILL_CLS);
+                showStatus('Thiếu dữ liệu đối chiếu trước khi lưu · đang đọc và điền lại CLS...');
+                queueRun(300);
+                return;
+            }
+            const scope = resolveClsScope();
+            const finalStable = await waitForFilledClsValuesStable(scope, expected, 500, 120000);
+            if (!finalStable.ok) {
+                if (finalStable.hidden) {
+                    showStatus('Tab đang ẩn · chưa lưu CLS...');
+                    queueRun(1000);
+                    return;
+                }
+                // Không lưu một form còn thiếu/đang render. Quay lại bước điền
+                // để nạp lại dữ liệu nguồn và kiểm tra toàn bộ lần nữa.
+                setStage(STAGE.FILL_CLS);
+                showStatus(`CLS chưa giữ đủ giá trị${finalStable.unstable?.length ? `: ${finalStable.unstable.join(', ')}` : ''} · đang điền lại...`);
+                queueRun(300);
                 return;
             }
         }
 
         // Ghi stage TRƯỚC cú bấm. Nếu Medinet reload toàn trang ngay trong lúc
         // lưu, userscript khởi động lại ở WAIT_CLS_RELOAD và không bấm Lưu lần 2.
+        c.clsSaveVerifiedOnCls = true;
         c.clsSavePageInstance = PAGE_INSTANCE_ID;
         c.clsSaveStartedAt = Date.now();
         setCase(c);
@@ -3174,13 +4083,21 @@ Tổng ERROR: ${errors.length}`;
     async function handleWaitClsReload() {
         const c = getCase();
         if (!c) throw new Error('Mất thông tin ca trong lúc chờ trang CLS tải lại.');
+        if (!c.clsSaveVerifiedOnCls) {
+            // Khôi phục an toàn các ca đang dở từ bản cũ: nếu chưa có dấu xác
+            // nhận đã đứng đúng tab CLS lúc bấm Lưu thì phải vào CLS và lưu lại.
+            setStage(STAGE.OPEN_CLS);
+            showStatus('Chưa xác nhận đã lưu trên đúng tab CLS · đang mở lại CLS...');
+            queueRun();
+            return;
+        }
         if (document.hidden) {
             showStatus('Đã gửi Lưu CLS · tab đang ẩn, chờ hiển thị để xác nhận trang tải xong...');
             queueRun(1000);
             return;
         }
 
-        showStatus('Đã gửi Lưu CLS · đang chờ trang tải/render lại hoàn tất...');
+        showStatus('Đã gửi Lưu CLS · đang chờ hồ sơ tải/render lại hoàn tất...');
         const settled = await waitForClsReloadSettled(c);
         if (settled.hidden) {
             showStatus('Tab bị ẩn khi chờ CLS tải lại · chưa mở Kết luận...');
@@ -3188,14 +4105,66 @@ Tổng ERROR: ${errors.length}`;
             return;
         }
         if (!settled.ok) {
-            throw new Error('Trang CLS chưa tải/render lại ổn định sau khi Lưu; chưa mở Kết luận.');
+            throw new Error('Hồ sơ chưa tải/render lại ổn định sau khi Lưu CLS; chưa mở Kết luận.');
         }
 
         c.clsReloadSettledAt = Date.now();
-        c.clsReloadMode = settled.fullReload ? 'FULL_RELOAD' : 'SPA_RENDER';
+        c.clsReloadMode = settled.landedOnDetailShell
+            ? 'DETAIL_SHELL'
+            : (settled.fullReload ? 'FULL_RELOAD' : 'SPA_RENDER');
         setCase(c);
-        setStage(STAGE.OPEN_CONCLUSION);
+        setStage(c.noLab ? STAGE.OPEN_CONCLUSION : STAGE.VERIFY_CLS_SAVED);
         queueRun();
+    }
+
+    async function handleVerifyClsSaved() {
+        const c = getCase();
+        if (!c) throw new Error('Mất thông tin ca khi kiểm tra CLS sau lưu.');
+        if (c.noLab) {
+            setStage(STAGE.OPEN_CONCLUSION);
+            queueRun();
+            return;
+        }
+        if (document.hidden) {
+            showStatus('Tab đang ẩn · chờ kiểm tra CLS sau lưu...');
+            queueRun(1000);
+            return;
+        }
+
+        if (!isClsPage()) {
+            showStatus('Đang mở lại CLS để xác nhận dữ liệu đã lưu thật...');
+            await clickSidebar(['Khám cận lâm sàng', 'Cận lâm sàng'], isClsPage, 'Khám cận lâm sàng');
+        }
+
+        const expected = c.clsExpectedData || {};
+        const scope = resolveClsScope();
+        showStatus('Đang đối chiếu lại CLS sau khi Medinet đã lưu/render...');
+        const verified = await waitForFilledClsValuesStable(scope, expected, 700, 15000);
+        if (verified.ok) {
+            c.clsPostSaveVerified = true;
+            c.clsPostSaveVerifiedAt = Date.now();
+            c.clsPostSaveRepairAttempts = 0;
+            setCase(c);
+            setStage(STAGE.OPEN_CONCLUSION);
+            queueRun();
+            return;
+        }
+
+        c.clsPostSaveRepairAttempts = Number(c.clsPostSaveRepairAttempts || 0) + 1;
+        setCase(c);
+        if (c.clsPostSaveRepairAttempts <= 2) {
+            setStage(STAGE.FILL_CLS);
+            showStatus(
+                `CLS sau lưu còn mất giá trị${verified.unstable?.length ? `: ${verified.unstable.join(', ')}` : ''} ` +
+                `· đang điền và lưu lại lần ${c.clsPostSaveRepairAttempts}/2...`
+            );
+            queueRun(200);
+            return;
+        }
+        throw new Error(
+            `CLS không giữ được dữ liệu sau 2 lần lưu${verified.unstable?.length ? `: ${verified.unstable.join(', ')}` : ''}; ` +
+            `không chuyển sang Kết luận và không tính hoàn tất.`
+        );
     }
 
     async function handleOpenConclusion() {
@@ -3242,7 +4211,7 @@ Tổng ERROR: ${errors.length}`;
             setCase(c);
         } catch (error) {
             // Chỉ quay lại SAVE_CONCLUSION khi cú lưu lỗi rõ ràng và trang chưa
-            // reload mất context; failCurrent sẽ áp dụng retry giới hạn.
+            // reload mất context; failCurrent sẽ tự chờ/gác ca rồi thử lại.
             setStage(STAGE.SAVE_CONCLUSION);
             throw error;
         }
@@ -3271,6 +4240,7 @@ Tổng ERROR: ${errors.length}`;
         // Ca không có XN được xem như ca hoàn tất bình thường. Xóa cờ nội bộ
         // trước khi lưu DONE để không tạo log riêng cho nhóm này.
         if (c.noLab) delete c.noLab;
+        removeDeferred(c);
         await addDone(c);
         const s = getStats();
         s.done++;
@@ -3325,13 +4295,20 @@ Tổng ERROR: ${errors.length}`;
         try {
             updatePanel();
             const stage = getStage();
+            touchHeartbeat(`RUN:${stage}`);
             log('RUN stage:', stage, 'URL:', location.href);
+            if (isLikelyLoginPage()) {
+                showStatus('Phiên Medinet đã về màn hình đăng nhập · giữ nguyên tiến trình; đăng nhập lại xong auto sẽ tiếp tục...');
+                queueRun(30000);
+                return;
+            }
             if (stage === STAGE.LIST) await handleList();
             else if (stage === STAGE.OPENING_CASE) await handleOpeningCase();
             else if (stage === STAGE.OPEN_CLS) await handleOpenCls();
             else if (stage === STAGE.FILL_CLS) await handleFillCls();
             else if (stage === STAGE.SAVE_CLS) await handleSaveCls();
             else if (stage === STAGE.WAIT_CLS_RELOAD) await handleWaitClsReload();
+            else if (stage === STAGE.VERIFY_CLS_SAVED) await handleVerifyClsSaved();
             else if (stage === STAGE.OPEN_CONCLUSION) await handleOpenConclusion();
             else if (stage === STAGE.SAVE_CONCLUSION) await handleSaveConclusion();
             else if (stage === STAGE.RETURN_LIST) await handleReturnList();
@@ -3351,6 +4328,7 @@ Tổng ERROR: ${errors.length}`;
             return;
         } finally {
             busy = false;
+            touchHeartbeat(`IDLE:${getStage()}`);
         }
     }
 
@@ -3390,16 +4368,66 @@ Tổng ERROR: ${errors.length}`;
         mo.observe(document.documentElement, { childList: true, subtree: true });
     }
 
+    function installRecoveryWatchdog() {
+        if (window.__m34ClsRecoveryWatchdogInstalled) return;
+        window.__m34ClsRecoveryWatchdogInstalled = true;
+        touchHeartbeat('WATCHDOG_INIT');
+
+        const check = () => {
+            if (!isActive() || document.hidden || safeReloadInFlight) return;
+            const heartbeat = getJson(KEY_HEARTBEAT, { time: Date.now() });
+            const silentMs = Date.now() - Number(heartbeat.time || 0);
+            if (silentMs < 4 * 60 * 1000) return;
+
+            const recoveries = Number(sessionStorage.getItem(KEY_WATCHDOG_RECOVERIES) || 0) + 1;
+            sessionStorage.setItem(KEY_WATCHDOG_RECOVERIES, String(recoveries));
+            warn('WATCHDOG: state machine không tiến triển, tự phục hồi.', {
+                silentMs, stage: getStage(), case: getCase(), recoveries
+            });
+            requestSafeReload(
+                `Watchdog phát hiện auto đứng ${Math.ceil(silentMs / 60000)} phút ở bước ${getStage()}`
+            ).catch(error => warn('WATCHDOG reload lỗi:', error));
+        };
+
+        setInterval(check, 30000);
+        window.addEventListener('online', () => {
+            touchHeartbeat('ONLINE_AGAIN');
+            if (isActive()) queueRun(200);
+        });
+        window.addEventListener('offline', () => {
+            if (isActive()) showStatus('Mất mạng · giữ nguyên ca và chờ kết nối lại...');
+        });
+    }
+
     // =====================================================================
     // INIT
     // =====================================================================
 
     async function init() {
+        // Không cho state đang chạy của bản cũ tiếp tục bằng logic mới. Sau khi
+        // cập nhật userscript, bản mới dừng sạch một lần và chờ người dùng bấm
+        // CHẠY; SKIP mơ hồ vẫn được giữ, DONE cũ được bỏ để đọc lại filter thật.
+        if (sessionStorage.getItem(KEY_RUNTIME_VERSION) !== SCRIPT_VERSION) {
+            const oldRuntimeVersion = sessionStorage.getItem(KEY_RUNTIME_VERSION) || 'không rõ';
+            const oldDone = Object.values(getLocalJson(KEY_DONE, {}));
+            if (oldDone.length) {
+                setLocalJson(KEY_PREVIOUS_DONE, {
+                    fromVersion: oldRuntimeVersion,
+                    archivedAt: Date.now(),
+                    items: oldDone
+                });
+            }
+            setActive(false);
+            resetRunState();
+            sessionStorage.setItem(KEY_RUNTIME_VERSION, SCRIPT_VERSION);
+        }
         rememberDetectedModel();
         releaseLegacyNotFoundSkips();
+        releaseLegacyTechnicalSkips();
         installNetworkTracker();
         ensurePanel();
         installNavigationWatcher();
+        installRecoveryWatchdog();
         setInterval(() => { if (isActive()) updatePanel(); }, 1000);
         document.addEventListener('visibilitychange', () => {
             updatePanel();
@@ -3412,7 +4440,7 @@ Tổng ERROR: ${errors.length}`;
             await sleep(700);
             queueRun();
         }
-        log('READY v2.0.14 SMART M3/M4 · ROBUST PAGER · SINGLE TAB');
+        log(`READY v${SCRIPT_VERSION} SMART M3/M4 · VERIFIED FULL SCAN + URINE NEGATIVE · SINGLE TAB`);
     }
 
     init();
