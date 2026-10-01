@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.3.15
+// @version      2.3.16
 // @description  Tự nhận diện M3/M4: có XN thì điền và lưu CLS; chưa có XN thì ghi nhận tại mục Khác; lưu Kết luận và nhật ký Excel.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
@@ -25,7 +25,7 @@
     // - Lỗi kỹ thuật => thử nhanh, gác tạm theo cooldown, rồi tự quay lại; không tự dừng batch.
     // - Không tự đoán kết quả xét nghiệm.
 
-    const SCRIPT_VERSION = '2.3.15';
+    const SCRIPT_VERSION = '2.3.16';
     const LOG = '[AUTO CLS SMART BATCH]';
 
     // =====================================================================
@@ -1234,6 +1234,8 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         if (!item || item.cccd !== String(c.cccd || '').replace(/\s/g, '')) return;
         const outcome = { status, reason, hoTen: c.hoTen || item.hoTen || '',
             ngayKham: c.ngayKham || '', maPhieu: c.maPhieu || '',
+            sidNguon: (c.labSourceSids?.length ? c.labSourceSids.join(' + ') : (c.sid || '')),
+            soSidNguon: Number(c.labSourceCount || c.labSourceSids?.length || (c.sid ? 1 : 0)),
             model: c.model || getCurrentModel(), updatedAt: new Date().toLocaleString('vi-VN') };
         if (c.ngayKham) {
             item.visits ||= [];
@@ -1276,8 +1278,8 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         const selected = q.items.flatMap(x => x.visits?.length ? [...x.visits.map(v => ({...x,...v})), ...(x.reason && x.status !== 'Đang xử lý các lượt khám' ? [{...x,ngayKham:'',maPhieu:''}] : [])] : [x]).filter(x => !unresolvedOnly || x.status !== 'Đã điền và lưu xong');
         if (!selected.length) { showBatchBubble('Đã hoàn tất toàn bộ', 'Không còn ca cần kiểm tra trong danh sách Excel.', 'ok'); return; }
         const rows = selected.map((x, i) => [i+1,x.model||'',x.hoTen||'',x.cccd,x.sheet||'',x.sourceRows?.join(', ')||x.sourceRow,x.ngayKham||'',
-            x.maPhieu||'',x.status||'Chưa xử lý',x.reason||(x.status==='Đã điền và lưu xong'?'':'Chưa xử lý xong trong lần chạy này'),x.updatedAt||'',q.file||'']);
-        const headers = ['STT','Mẫu','Họ tên','CCCD','Sheet Excel','Dòng Excel','Ngày khám','Mã phiếu','Kết quả xử lý','Lý do cần kiểm tra','Thời điểm cập nhật','File nguồn'];
+            x.maPhieu||'',x.sidNguon||'',x.soSidNguon||'',x.status||'Chưa xử lý',x.reason||(x.status==='Đã điền và lưu xong'?'':'Chưa xử lý xong trong lần chạy này'),x.updatedAt||'',q.file||'']);
+        const headers = ['STT','Mẫu','Họ tên','CCCD','Sheet Excel','Dòng Excel','Ngày khám','Mã phiếu','SID nguồn','Số SID','Kết quả xử lý','Lý do cần kiểm tra','Thời điểm cập nhật','File nguồn'];
         const url = URL.createObjectURL(makeNotFoundXlsx(rows, headers));
         const link = document.createElement('a');link.href=url;
         link.download=`Auto_CLS_${unresolvedOnly?'Can_kiem_tra':'Tat_ca_ket_qua'}_${new Date().toISOString().replace(/[:.]/g,'-')}.xlsx`;
@@ -3071,6 +3073,56 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         return `${dd}${mm}${yy}-`;
     }
 
+    function findFirstCol(header, names) {
+        for (const name of names) {
+            const i = colIndex(header, name);
+            if (i >= 0) return i;
+        }
+        return -1;
+    }
+
+    function normalizeLabCompareValue(value) {
+        const raw = String(value ?? '').trim();
+        if (!raw) return '';
+        const compact = raw.replace(/\s+/g, '').replace(',', '.');
+        if (/^[+-]?\d+(?:\.\d+)?$/.test(compact)) {
+            const n = Number(compact);
+            if (Number.isFinite(n)) return `#${n}`;
+        }
+        return norm(raw).replace(/\s+/g, '');
+    }
+
+    function mergeComplementaryLabRows(items, header) {
+        if (!items?.length) return { ok: false, reason: 'Không có dòng xét nghiệm để gộp.' };
+        const merged = { ...items[0].data };
+        const analyteColumns = [...new Set([...FIELD_MAP.map(x => x.column), 'NIT'])];
+        const conflicts = [];
+
+        for (const col of analyteColumns) {
+            const values = [];
+            for (const item of items) {
+                const raw = getData(item.data, col);
+                if (raw === undefined || String(raw).trim() === '') continue;
+                const key = normalizeLabCompareValue(raw);
+                if (!values.some(x => x.key === key)) values.push({ key, raw: String(raw).trim(), sid: getData(item.data, 'SID') || '' });
+            }
+            if (values.length > 1) {
+                conflicts.push({ col, values });
+                continue;
+            }
+            if (values.length === 1) merged[col] = values[0].raw;
+        }
+
+        if (conflicts.length) {
+            const detail = conflicts.slice(0, 6).map(x => `${x.col}: ${x.values.map(v => `${v.raw}${v.sid ? ` [${v.sid}]` : ''}`).join(' / ')}`).join('; ');
+            return { ok: false, conflicts, reason: `Nhiều SID có chỉ số xung đột (${detail}${conflicts.length > 6 ? '; ...' : ''})` };
+        }
+
+        const sids = [...new Set(items.map(x => String(getData(x.data, 'SID') || '').trim()).filter(Boolean))];
+        merged.SID = sids.join(' + ');
+        return { ok: true, data: merged, sids };
+    }
+
     async function findLabForCase(c) {
         const { header, rows } = await fetchSheetRows();
         const iName = colIndex(header, 'Tên bệnh nhân');
@@ -3078,11 +3130,13 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         const iSex = colIndex(header, 'Giới tính');
         const iDate = colIndex(header, 'Ngày XN');
         const iSid = colIndex(header, 'SID');
+        const iCccd = findFirstCol(header, ['CCCD', 'Định danh cá nhân', 'Số CCCD', 'Căn cước công dân']);
         if ([iName, iDate, iSid].some(i => i < 0)) {
             throw new Error('Sheet XN thiếu một trong các cột: Tên bệnh nhân, Ngày XN, SID.');
         }
 
         const name = norm(c.hoTen);
+        const wantedCccd = String(c.cccd || '').replace(/\D/g, '');
         const labDateOrder = sheetDateOrderCache || inferLabDateOrder(rows, iDate);
         sheetDateOrderCache = labDateOrder;
         const expectedSidPrefix = sidPrefixForExamDate(c.ngayKham);
@@ -3092,32 +3146,39 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             if (norm(r[iName]) !== name) continue;
             if (!labDateMatchesExam(r[iDate], c.ngayKham, labDateOrder)) continue;
 
-            // Nếu SID có cấu trúc ngày DDMMYY- thì dùng làm lớp kiểm tra thứ hai.
-            // SID không mang prefix ngày vẫn được chấp nhận, không tự suy đoán.
             const sid = String(r[iSid] || '').trim();
             if (/^\d{6}-/.test(sid) && expectedSidPrefix && !sid.startsWith(expectedSidPrefix)) continue;
+
+            const rowCccd = iCccd >= 0 ? String(r[iCccd] || '').replace(/\D/g, '') : '';
+            // Nếu Sheet có CCCD ở dòng này thì phải khớp tuyệt đối. Dòng không có CCCD
+            // vẫn được giữ để hỗ trợ nguồn XN cũ chỉ có tên/tuổi/giới.
+            if (wantedCccd && rowCccd && rowCccd !== wantedCccd) continue;
 
             candidates.push({
                 data: buildData(header, r),
                 labDate: String(r[iDate] || '').trim(),
                 age: iAge >= 0 ? String(r[iAge] || '').trim() : '',
-                sex: iSex >= 0 ? String(r[iSex] || '').trim() : ''
+                sex: iSex >= 0 ? String(r[iSex] || '').trim() : '',
+                cccd: rowCccd
             });
         }
 
         if (candidates.length === 0) return { status: 'NOT_FOUND', matches: [] };
         if (candidates.length === 1) return {
             status: 'OK', data: candidates[0].data,
-            labDate: candidates[0].labDate, labDateOrder
+            labDate: candidates[0].labDate, labDateOrder,
+            merged: false, sids: [String(getData(candidates[0].data, 'SID') || '').trim()].filter(Boolean)
         };
 
-        // Chỉ dùng năm sinh/tuổi và giới để GỠ TRÙNG, không dùng ở bước tìm chính.
-        // Sheet hiện có dòng ghi "1993 tuổi": số 1900–2100 được hiểu là năm sinh;
-        // số nhỏ hơn được hiểu là tuổi thực tại ngày khám.
         const dob = parseDateDMY(c.ngaySinh);
         const birthYear = dob ? dob.getFullYear() : null;
         const validAges = expectedAgeRange(c.ngaySinh, c.ngayKham);
         let narrowed = candidates;
+
+        if (iCccd >= 0 && wantedCccd) {
+            const exactCccd = narrowed.filter(x => x.cccd === wantedCccd);
+            if (exactCccd.length) narrowed = exactCccd;
+        }
 
         if (iAge >= 0 && (birthYear || validAges.length)) {
             const byBirth = narrowed.filter(x => {
@@ -3137,9 +3198,25 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
 
         if (narrowed.length === 1) return {
             status: 'OK', data: narrowed[0].data,
-            labDate: narrowed[0].labDate, labDateOrder
+            labDate: narrowed[0].labDate, labDateOrder,
+            merged: false, sids: [String(getData(narrowed[0].data, 'SID') || '').trim()].filter(Boolean)
         };
-        return { status: 'DUPLICATE', matches: narrowed.map(x => x.data) };
+
+        // Một người có thể có nhiều SID trong cùng ngày: ví dụ SID máu/sinh hóa
+        // và SID nước tiểu. Nếu các SID chỉ bổ sung trường còn thiếu thì gộp thành
+        // một bộ CLS. Chỉ chặn khi cùng một chỉ số có hai giá trị thực sự khác nhau.
+        const merged = mergeComplementaryLabRows(narrowed, header);
+        if (merged.ok) return {
+            status: 'OK', data: merged.data,
+            labDate: narrowed[0].labDate, labDateOrder,
+            merged: true, sids: merged.sids, sourceCount: narrowed.length
+        };
+
+        return {
+            status: 'DUPLICATE',
+            matches: narrowed.map(x => x.data),
+            conflictReason: merged.reason || 'Nhiều SID không thể gộp an toàn.'
+        };
     }
 
     // =====================================================================
@@ -4448,8 +4525,15 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             return;
         }
         if (match.status === 'DUPLICATE') {
-            await skipCurrent(`Tìm thấy ${match.matches.length} kết quả cùng Họ tên và Ngày XN - không tự chọn.`, 'DUPLICATE');
+            await skipCurrent(
+                match.conflictReason || `Tìm thấy ${match.matches.length} kết quả cùng người/ngày XN nhưng không thể gộp an toàn.`,
+                'DUPLICATE'
+            );
             return;
+        }
+
+        if (match.merged) {
+            showStatus(`Đã nhận diện ${match.sourceCount || match.sids?.length || 2} SID cùng lượt · đang gộp XN: ${(match.sids || []).join(' + ')}`);
         }
 
         // Lớp chặn cuối ngay trước khi điền: dù logic tìm phía trên có thay đổi
@@ -4469,6 +4553,9 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
 
         const report = await fillCls(match.data);
         c.sid = report.sid;
+        c.labMerged = !!match.merged;
+        c.labSourceCount = Number(match.sourceCount || match.sids?.length || (report.sid ? 1 : 0));
+        c.labSourceSids = match.sids || (report.sid ? [report.sid] : []);
         c.fillReport = report;
         c.clsExpectedData = buildExpectedClsData(match.data);
         setCase(c);
