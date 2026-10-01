@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.3.0
-// @description  Tự nhận diện M3/M4: có XN thì điền, không có XN vẫn lưu CLS; sau đó lưu Kết luận, quay lại danh sách và tiếp tục batch.
+// @version      2.3.15
+// @description  Tự nhận diện M3/M4: có XN thì điền và lưu CLS; chưa có XN thì ghi nhận tại mục Khác; lưu Kết luận và nhật ký Excel.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
 // @run-at       document-idle
@@ -20,12 +20,12 @@
     // - Một ca chỉ được tính DONE sau chuỗi:
     //     điền CLS -> Lưu CLS -> mở Kết luận -> Lưu Kết luận
     //     -> quay về Danh sách -> chờ bảng tải ổn định -> tiếp tục ca kế.
-    // - Không tìm thấy XN => vẫn Lưu CLS trống rồi mở/lưu Kết luận.
+    // - Không tìm thấy XN => ghi “Công dân chưa có kết quả xét nghiệm” vào mục Khác, vẫn lưu CLS/Kết luận và đánh dấu để xuất Excel kiểm tra.
     // - Trùng XN / dữ liệu không đủ chắc chắn => SKIP.
     // - Lỗi kỹ thuật => thử nhanh, gác tạm theo cooldown, rồi tự quay lại; không tự dừng batch.
     // - Không tự đoán kết quả xét nghiệm.
 
-    const SCRIPT_VERSION = '2.3.0';
+    const SCRIPT_VERSION = '2.3.15';
     const LOG = '[AUTO CLS SMART BATCH]';
 
     // =====================================================================
@@ -74,6 +74,8 @@
 
     // Urê có thể không được chạy thường quy; giữ logic loại cảnh báo như script cũ.
     const MISSING_WARNING_EXCLUDE = ['Urê'];
+
+    const NO_LAB_RESULT_NOTE = 'Công dân chưa có kết quả xét nghiệm';
 
     // =====================================================================
     // STORAGE
@@ -147,6 +149,7 @@
     // Các stage được lưu qua SPA/page reload.
     const STAGE = {
         LIST: 'LIST',
+        SKIP_RETURN: 'SKIP_RETURN',
         OPENING_CASE: 'OPENING_CASE',
         OPEN_CLS: 'OPEN_CLS',
         FILL_CLS: 'FILL_CLS',
@@ -479,6 +482,7 @@
     function caseKey(c) {
         if (!c) return '';
         const model = c.model || getCurrentModel() || 'UNKNOWN';
+        if (c.maPhieu) return `${model}|CCCD:${c.cccd}|PHIEU:${c.maPhieu}`;
         if (c.cccd) return `${model}|CCCD:${c.cccd}|DATE:${c.ngayKham || ''}`;
         return `${model}|NAME:${norm(c.hoTen)}|DOB:${c.ngaySinh || ''}|SEX:${norm(c.gioiTinh)}|DATE:${c.ngayKham || ''}`;
     }
@@ -486,6 +490,11 @@
     // Bản 1.5 chỉ chạy một tab: bỏ toàn bộ claim/lease/worker để state đơn giản và ổn định hơn.
 
     async function addDone(c) {
+        recordExcelOutcome(
+            c,
+            c?.noLabResult ? 'Đã lưu - chưa có kết quả xét nghiệm' : 'Đã điền và lưu xong',
+            c?.noLabResult ? (c.noLabNote || NO_LAB_RESULT_NOTE) : ''
+        );
         const key = caseKey(c);
         if (!key) return;
         const done = getLocalJson(KEY_DONE, {});
@@ -498,6 +507,8 @@
     }
 
     async function addSkipped(c, reason, type) {
+        const labels = { NOT_FOUND: 'Không tìm thấy xét nghiệm', PROFILE_NOT_FOUND: 'Không tìm thấy hồ sơ', MULTIPLE_VISITS: 'Nhiều lượt khám - chưa tự chọn', DUPLICATE: 'Trùng kết quả xét nghiệm - chưa tự chọn' };
+        recordExcelOutcome(c, labels[type] || 'Không tự quyết được', reason);
         const key = caseKey(c);
         const stage = getStage();
         const retryCount = getRetryCount(c || {}, stage);
@@ -520,24 +531,6 @@
 
     function isSkipped(c) {
         return !!getLocalJson(KEY_SKIPPED, {})[caseKey(c)];
-    }
-
-    function releaseLegacyNotFoundSkips() {
-        // Bản cũ từng đưa ca không tìm thấy XN vào SKIP. Từ v2.0.13 các ca này
-        // phải được chạy lại để lưu CLS trống + Kết luận; chỉ gỡ NOT_FOUND,
-        // giữ nguyên DUPLICATE/INVALID vì đó là các ca chưa đủ chắc chắn.
-        const skipped = getLocalJson(KEY_SKIPPED, {});
-        let released = 0;
-        for (const [key, item] of Object.entries(skipped)) {
-            if (item?.type !== 'NOT_FOUND') continue;
-            delete skipped[key];
-            released++;
-        }
-        if (released) {
-            setLocalJson(KEY_SKIPPED, skipped);
-            log(`Đã mở lại ${released} ca NOT_FOUND cũ để lưu CLS trống + Kết luận.`);
-        }
-        return released;
     }
 
     function releaseLegacyTechnicalSkips() {
@@ -863,6 +856,7 @@
                 <span id="m3cls-stage" style="display:none">-</span>
                 <span id="m3cls-notfound" style="display:none">0</span><span id="m3cls-dup" style="display:none">0</span><span id="m3cls-invalid" style="display:none">0</span><span id="m3cls-elapsed" style="display:none">—</span>
             </div>
+            <div style="padding:0 14px 10px"><div id="m3cls-excel-label" style="font-size:11px;margin-bottom:6px;overflow-wrap:anywhere"></div><input id="m3cls-excel-file" type="file" accept=".xlsx" style="display:none"><button id="m3cls-excel-import" style="background:#155e75;color:white;padding:8px;border-radius:8px;border:0">NẠP EXCEL CCCD</button> <button id="m3cls-excel-run" style="background:#15803d;color:white;padding:8px;border-radius:8px;border:0">▶ CHẠY EXCEL</button><div style="margin-top:6px"><button id="m3cls-excel-unresolved" style="background:#92400e;color:white;padding:7px;border-radius:8px;border:0">XUẤT CA CẦN KIỂM TRA</button> <button id="m3cls-excel-all" style="background:#164e63;color:white;padding:7px;border-radius:8px;border:0">XUẤT TẤT CẢ</button></div></div>
             <div class="actions"><button id="m3cls-start">▶ CHẠY</button><button id="m3cls-stop">■ DỪNG</button><button id="m3cls-report" title="Báo cáo">📋</button><button id="m3cls-reset-skip" title="Xóa SKIP để chạy lại">↻ SKIP</button></div>`;
         document.body.appendChild(p);
 
@@ -872,6 +866,12 @@
         fab.innerHTML = `<div class="m3cls-reactor"><b id="m3cls-fab-model">M?</b></div><span class="m3cls-fab-label" id="m3cls-fab-label">MỞ</span>`;
         document.body.appendChild(fab);
 
+        document.getElementById('m3cls-excel-import').onclick = () => document.getElementById('m3cls-excel-file').click();
+        document.getElementById('m3cls-excel-file').onchange = importCccdExcel;
+        document.getElementById('m3cls-excel-run').onclick = () => startBatch(true);
+        document.getElementById('m3cls-excel-unresolved').onclick = () => exportExcelQueue(true);
+        document.getElementById('m3cls-excel-all').onclick = () => exportExcelQueue(false);
+        updateExcelQueueLabel();
         document.getElementById('m3cls-start').addEventListener('click', startBatch);
         document.getElementById('m3cls-stop').addEventListener('click', stopBatch);
         document.getElementById('m3cls-report').addEventListener('click', showReport);
@@ -1020,6 +1020,7 @@
 
     function buildFullReport() {
         const skipped = Object.values(getLocalJson(KEY_SKIPPED, {}))
+            .filter(x => x.type !== 'NOT_FOUND')
             .sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
         const errors = getLocalJson(KEY_ERRORS, [])
             .slice()
@@ -1084,29 +1085,112 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         return txt;
     }
 
+    function getNotFoundRows() {
+        return Object.values(getLocalJson(KEY_SKIPPED, {}))
+            .filter(x => x.type === 'NOT_FOUND')
+            .sort((a, b) => Number(a.time || 0) - Number(b.time || 0))
+            .map((x, i) => {
+                const c = x.c || {};
+                return [i + 1, c.model || '', c.hoTen || '', c.cccd || '', c.ngaySinh || '',
+                    c.gioiTinh || '', c.ngayKham || '', c.pageNumber || '', c.rowStt || '',
+                    'Không tìm thấy xét nghiệm', x.time ? new Date(x.time).toLocaleString('vi-VN') : ''];
+            });
+    }
+
+    const NOT_FOUND_HEADERS = ['STT', 'Mẫu', 'Họ tên', 'CCCD', 'Ngày sinh', 'Giới tính',
+        'Ngày khám', 'Trang nguồn', 'STT nguồn', 'Kết quả tra cứu', 'Thời điểm ghi nhận'];
+
+    // XLSX độc lập: ZIP không nén + OOXML, không tải thư viện bên ngoài.
+    function makeNotFoundXlsx(rows, headers = NOT_FOUND_HEADERS) {
+        const enc = new TextEncoder();
+        const xml = value => String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const cells = [headers, ...rows].map((row, r) => `<row r="${r + 1}">${row.map((v, c) =>
+            `<c r="${String.fromCharCode(65 + c)}${r + 1}" t="inlineStr" s="${r === 0 ? 1 : 0}"><is><t xml:space="preserve">${xml(v)}</t></is></c>`).join('')}</row>`).join('');
+        const files = {
+            '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>',
+            '_rels/.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+            'xl/workbook.xml': `<workbook xmlns="${ns}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Kết quả Auto CLS" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+            'xl/_rels/workbook.xml.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>',
+            'xl/styles.xml': `<styleSheet xmlns="${ns}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF155E75"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="49" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`,
+            'xl/worksheets/sheet1.xml': `<worksheet xmlns="${ns}"><dimension ref="A1:K${rows.length + 1}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${[7,8,30,19,15,12,15,14,14,30,25].map((w,i)=>`<col min="${i+1}" max="${i+1}" width="${headers === NOT_FOUND_HEADERS ? w : [7,8,30,19,18,16,15,38,75,25,40][i]}" customWidth="1"/>`).join('')}</cols><sheetData>${cells}</sheetData><autoFilter ref="A1:K${rows.length + 1}"/></worksheet>`
+        };
+        const crc32 = bytes => {
+            let crc = 0xffffffff;
+            for (const byte of bytes) { crc ^= byte; for (let i=0;i<8;i++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0); }
+            return (crc ^ 0xffffffff) >>> 0;
+        };
+        const parts = [], central = []; let offset = 0, centralSize = 0;
+        for (const [name, content] of Object.entries(files)) {
+            const n = enc.encode(name), data = enc.encode(content), crc = crc32(data);
+            const h = new Uint8Array(30), v = new DataView(h.buffer);
+            v.setUint32(0,0x04034b50,true); v.setUint16(4,20,true); v.setUint16(12,33,true);
+            v.setUint32(14,crc,true); v.setUint32(18,data.length,true); v.setUint32(22,data.length,true); v.setUint16(26,n.length,true);
+            parts.push(h,n,data);
+            const ch = new Uint8Array(46), cv = new DataView(ch.buffer);
+            cv.setUint32(0,0x02014b50,true); cv.setUint16(4,20,true); cv.setUint16(6,20,true); cv.setUint16(14,33,true);
+            cv.setUint32(16,crc,true); cv.setUint32(20,data.length,true); cv.setUint32(24,data.length,true);
+            cv.setUint16(28,n.length,true); cv.setUint32(42,offset,true);
+            central.push(ch,n); centralSize += ch.length+n.length; offset += h.length+n.length+data.length;
+        }
+        const end = new Uint8Array(22), ev = new DataView(end.buffer);
+        ev.setUint32(0,0x06054b50,true); ev.setUint16(8,central.length/2,true); ev.setUint16(10,central.length/2,true);
+        ev.setUint32(12,centralSize,true); ev.setUint32(16,offset,true);
+        return new Blob([...parts,...central,end], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    }
+
+    function exportNotFoundExcel() {
+        const rows = getNotFoundRows();
+        if (!rows.length) { showBatchBubble('Chưa có hồ sơ', 'Danh sách không tìm thấy xét nghiệm đang trống.', 'info'); return; }
+        const url = URL.createObjectURL(makeNotFoundXlsx(rows));
+        const a = document.createElement('a'); a.href = url;
+        a.download = `Auto_CLS_Khong_tim_thay_XN_${new Date().toISOString().replace(/[:.]/g,'-')}.xlsx`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+
     function showReport() {
         document.getElementById('m3cls-report-overlay')?.remove();
-        const txt = buildFullReport();
-        const overlay = document.createElement('div');
-        overlay.id = 'm3cls-report-overlay';
-        overlay.innerHTML = `
-            <div id="m3cls-report-box">
-                <div id="m3cls-report-head"><span>📋 AUTO CLS SMART ${getModelLabel()} · SKIP / ERROR</span><span>${Object.keys(getLocalJson(KEY_SKIPPED, {})).length} SKIP · ${getLocalJson(KEY_ERRORS, []).length} ERROR</span></div>
-                <pre id="m3cls-report-text"></pre>
-                <div id="m3cls-report-actions"><button id="m3cls-copy-all">SAO CHÉP TOÀN BỘ</button><button id="m3cls-clear-errors">XÓA ERROR</button><button id="m3cls-close-report">ĐÓNG</button></div>
-            </div>`;
+        const rows = getNotFoundRows();
+        const overlay = document.createElement('div'); overlay.id = 'm3cls-report-overlay';
+        overlay.innerHTML = `<div id="m3cls-report-box">
+            <div id="m3cls-report-head"><span>📋 Theo dõi hồ sơ Auto CLS</span><span>${rows.length} không tìm thấy XN</span></div>
+            <div id="m3cls-report-actions" style="justify-content:flex-start;flex-wrap:wrap"><button id="m3cls-tab-notfound">KHÔNG TÌM THẤY XN (${rows.length})</button><button id="m3cls-tab-errors">LỖI / BỎ QUA KHÁC</button></div>
+            <div id="m3cls-report-content" style="flex:1;min-height:0;overflow:auto"></div>
+            <div id="m3cls-report-actions" style="flex-wrap:wrap"><button id="m3cls-export-xlsx" style="background:#15803d;color:white">XUẤT EXCEL · KHÔNG TÌM THẤY XN</button><button id="m3cls-copy-all">SAO CHÉP</button><button id="m3cls-clear-errors">XÓA LỖI</button><button id="m3cls-close-report">ĐÓNG</button></div></div>`;
         document.body.appendChild(overlay);
-        document.getElementById('m3cls-report-text').textContent = txt;
-        document.getElementById('m3cls-close-report').onclick = () => overlay.remove();
-        document.getElementById('m3cls-clear-errors').onclick = () => resetErrorList(overlay);
-        overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-        document.getElementById('m3cls-copy-all').onclick = async e => {
-            try {
-                await navigator.clipboard.writeText(txt);
-                e.currentTarget.textContent = 'ĐÃ SAO CHÉP';
-            } catch (_) {
-                showBatchBubble('Không thể tự sao chép', 'Trình duyệt không cho phép sao chép tự động. Hãy bôi đen nội dung trong cửa sổ báo cáo để copy.', 'warn', 6500);
+        const content = overlay.querySelector('#m3cls-report-content'); let copyText = '';
+        const setTab = technical => {
+            content.replaceChildren();
+            overlay.querySelector('#m3cls-clear-errors').style.display = technical ? '' : 'none';
+            for (const [id, active] of [['m3cls-tab-notfound', !technical], ['m3cls-tab-errors', technical]]) {
+                const btn = overlay.querySelector('#'+id); btn.style.background = active ? '#0891b2' : '#162236'; btn.style.color = 'white';
             }
+            if (technical) {
+                copyText = buildFullReport();
+                const pre = document.createElement('pre'); pre.id = 'm3cls-report-text'; pre.textContent = copyText; content.appendChild(pre); return;
+            }
+            copyText = [NOT_FOUND_HEADERS, ...rows].map(r => r.join('\t')).join('\n');
+            const note = document.createElement('p'); note.style.cssText = 'padding:0 16px;color:#bae6fd';
+            note.textContent = 'Chỉ gồm hồ sơ không tìm thấy xét nghiệm. Danh sách đã lưu gồm M3/M4 và các lần chạy trước, giữ đến khi xóa danh sách bỏ qua.'; content.appendChild(note);
+            if (!rows.length) { note.textContent = 'Chưa có hồ sơ không tìm thấy xét nghiệm.'; return; }
+            const table = document.createElement('table'); table.style.cssText = 'border-collapse:collapse;white-space:nowrap;font:12px Segoe UI,Arial;width:100%';
+            [NOT_FOUND_HEADERS, ...rows].forEach((row, i) => {
+                const tr = document.createElement('tr');
+                row.forEach(v => { const td = document.createElement(i ? 'td' : 'th'); td.textContent = String(v); td.style.cssText = 'padding:10px 12px;text-align:left;border-bottom:1px solid #243447;' + (!i ? 'position:sticky;top:0;background:#155e75;' : ''); tr.appendChild(td); }); table.appendChild(tr);
+            }); content.appendChild(table);
+        };
+        setTab(false);
+        overlay.querySelector('#m3cls-tab-notfound').onclick = () => setTab(false);
+        overlay.querySelector('#m3cls-tab-errors').onclick = () => setTab(true);
+        overlay.querySelector('#m3cls-export-xlsx').onclick = exportNotFoundExcel;
+        overlay.querySelector('#m3cls-close-report').onclick = () => overlay.remove();
+        overlay.querySelector('#m3cls-clear-errors').onclick = () => resetErrorList(overlay);
+        overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+        overlay.querySelector('#m3cls-copy-all').onclick = async e => {
+            try { await navigator.clipboard.writeText(copyText); e.target.textContent = 'ĐÃ SAO CHÉP'; }
+            catch (_) { showBatchBubble('Không thể tự sao chép', 'Hãy chọn nội dung trong cửa sổ để sao chép.', 'warn'); }
         };
     }
 
@@ -1141,7 +1225,278 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         showBatchBubble('Đã xóa SKIP', 'Có thể bấm CHẠY để tìm lại các ca đã bỏ qua.', 'ok', 4000);
     }
 
-    async function startBatch() {
+    const KEY_EXCEL_QUEUE = 'm34_cls_excel_queue_v236';
+    const KEY_EXCEL_MODE = 'm34_cls_excel_mode_v236';
+
+    function recordExcelOutcome(c, status, reason = '') {
+        if (sessionStorage.getItem(KEY_EXCEL_MODE) !== '1' || !c) return;
+        const q = getJson(KEY_EXCEL_QUEUE, null), item = q?.items?.[q.index];
+        if (!item || item.cccd !== String(c.cccd || '').replace(/\s/g, '')) return;
+        const outcome = { status, reason, hoTen: c.hoTen || item.hoTen || '',
+            ngayKham: c.ngayKham || '', maPhieu: c.maPhieu || '',
+            model: c.model || getCurrentModel(), updatedAt: new Date().toLocaleString('vi-VN') };
+        if (c.ngayKham) {
+            item.visits ||= [];
+            const key = caseKey(c);
+            const previous = item.visits.find(x => x.key === key);
+            if (previous) Object.assign(previous, outcome);
+            else item.visits.push({ key, ...outcome });
+            item.status = 'Đang xử lý các lượt khám';
+        } else Object.assign(item, outcome);
+        setJson(KEY_EXCEL_QUEUE, q);
+    }
+
+    function advanceCompletedExcelItem() {
+        if (sessionStorage.getItem(KEY_EXCEL_MODE) !== '1') return;
+        const q = getJson(KEY_EXCEL_QUEUE, null), item = q?.items?.[q.index];
+        if (!item?.plannedVisits?.length) return;
+        const finished = new Set((item.visits || []).map(v => v.key));
+        if (!item.plannedVisits.every(key => finished.has(key))) return;
+        finishExcelVisits();
+        const updated = getJson(KEY_EXCEL_QUEUE, q);
+        updated.index++;
+        setJson(KEY_EXCEL_QUEUE, updated);
+        updateExcelQueueLabel();
+    }
+
+    function finishExcelVisits() {
+        const q = getJson(KEY_EXCEL_QUEUE, null), item = q?.items?.[q.index];
+        if (!item?.visits?.length) return;
+        item.status = item.visits.every(x => x.status === 'Đã điền và lưu xong')
+            ? 'Đã điền và lưu xong' : 'Đã duyệt - có lượt cần kiểm tra';
+        if (item.visits.some(x => x.status === 'Đã lưu - chưa có kết quả xét nghiệm')) {
+            item.reason = 'Có lượt đã lưu CLS với ghi chú: ' + NO_LAB_RESULT_NOTE;
+        }
+        setJson(KEY_EXCEL_QUEUE, q);
+    }
+
+    function exportExcelQueue(unresolvedOnly = true) {
+        const q = getJson(KEY_EXCEL_QUEUE, null);
+        if (!q?.items?.length) { showBatchBubble('Chưa có kết quả Excel', 'Nạp danh sách CCCD trước.', 'warn'); return; }
+        const selected = q.items.flatMap(x => x.visits?.length ? [...x.visits.map(v => ({...x,...v})), ...(x.reason && x.status !== 'Đang xử lý các lượt khám' ? [{...x,ngayKham:'',maPhieu:''}] : [])] : [x]).filter(x => !unresolvedOnly || x.status !== 'Đã điền và lưu xong');
+        if (!selected.length) { showBatchBubble('Đã hoàn tất toàn bộ', 'Không còn ca cần kiểm tra trong danh sách Excel.', 'ok'); return; }
+        const rows = selected.map((x, i) => [i+1,x.model||'',x.hoTen||'',x.cccd,x.sheet||'',x.sourceRows?.join(', ')||x.sourceRow,x.ngayKham||'',
+            x.maPhieu||'',x.status||'Chưa xử lý',x.reason||(x.status==='Đã điền và lưu xong'?'':'Chưa xử lý xong trong lần chạy này'),x.updatedAt||'',q.file||'']);
+        const headers = ['STT','Mẫu','Họ tên','CCCD','Sheet Excel','Dòng Excel','Ngày khám','Mã phiếu','Kết quả xử lý','Lý do cần kiểm tra','Thời điểm cập nhật','File nguồn'];
+        const url = URL.createObjectURL(makeNotFoundXlsx(rows, headers));
+        const link = document.createElement('a');link.href=url;
+        link.download=`Auto_CLS_${unresolvedOnly?'Can_kiem_tra':'Tat_ca_ket_qua'}_${new Date().toISOString().replace(/[:.]/g,'-')}.xlsx`;
+        document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    }
+
+    async function readCccdXlsx(file) {
+        const bytes = new Uint8Array(await file.arrayBuffer()), view = new DataView(bytes.buffer);
+        let end = bytes.length - 22;
+        while (end >= Math.max(0, bytes.length - 65557) && view.getUint32(end, true) !== 0x06054b50) end--;
+        if (end < Math.max(0, bytes.length - 65557)) throw new Error('Chỉ hỗ trợ file .xlsx, hãy lưu Excel thành .xlsx.');
+        const entries = new Map(); let pos = view.getUint32(end + 16, true);
+        for (let i=0; i<view.getUint16(end+10,true); i++) {
+            if (view.getUint32(pos,true)!==0x02014b50) throw new Error('Cấu trúc XLSX không hợp lệ.');
+            const nameLen=view.getUint16(pos+28,true), extra=view.getUint16(pos+30,true), comment=view.getUint16(pos+32,true);
+            const name=new TextDecoder().decode(bytes.slice(pos+46,pos+46+nameLen));
+            entries.set(name,{method:view.getUint16(pos+10,true),size:view.getUint32(pos+20,true),offset:view.getUint32(pos+42,true),flags:view.getUint16(pos+8,true)});
+            pos+=46+nameLen+extra+comment;
+        }
+        const read = async name => {
+            const e=entries.get(name); if(!e) return null;
+            if(e.flags&1) throw new Error('Không đọc được file Excel có mật khẩu.');
+            const at=e.offset+30+view.getUint16(e.offset+26,true)+view.getUint16(e.offset+28,true);
+            let data=bytes.slice(at,at+e.size);
+            if(e.method===8) data=new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+            else if(e.method!==0) throw new Error('Kiểu nén Excel chưa được hỗ trợ.');
+            const doc=new DOMParser().parseFromString(new TextDecoder().decode(data),'application/xml');
+            if(doc.querySelector('parsererror')) throw new Error('Nội dung Excel không hợp lệ.');
+            return doc;
+        };
+        const wb=await read('xl/workbook.xml'),rels=await read('xl/_rels/workbook.xml.rels');
+        if(!wb||!rels) throw new Error('Không tìm thấy sổ Excel.');
+        const shared=await read('xl/sharedStrings.xml');
+        const text = node => [...node.getElementsByTagNameNS('*','t')].map(t=>t.textContent).join('');
+        const strings=shared?[...shared.getElementsByTagNameNS('*','si')].map(text):[];
+        const valueOf = cell => {
+            if(!cell)return '';
+            const type=cell.getAttribute('t'),raw=cell.getElementsByTagNameNS('*','v')[0]?.textContent||'';
+            return String(type==='s'?strings[Number(raw)]??'':type==='inlineStr'?text(cell):raw).trim();
+        };
+        const result=[],seen=new Set(),invalid=[];
+        for(const sheet of wb.getElementsByTagNameNS('*','sheet')) {
+            const id=sheet.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','id');
+            const rel=[...rels.getElementsByTagNameNS('*','Relationship')].find(r=>r.getAttribute('Id')===id);
+            const target=rel?.getAttribute('Target');if(!target)continue;
+            const path=target.startsWith('/')?target.slice(1):'xl/'+target.replace(/^\.\//,'');
+            const doc=await read(path);if(!doc)throw new Error('Không đọc được sheet '+sheet.getAttribute('name'));
+            const cells=new Map([...doc.getElementsByTagNameNS('*','c')].map(c=>[c.getAttribute('r'),c]));
+            for(const [ref,cell] of cells) {
+                if(!/^C\d+$/.test(ref)||Number(ref.slice(1))<2)continue;
+                const row=Number(ref.slice(1));let value=valueOf(cell);if(!value)continue;
+                const type=cell.getAttribute('t');
+                if(!type||type==='n'){const n=Number(value);if(Number.isSafeInteger(n)&&n>=0)value=String(n).padStart(12,'0');}
+                value=value.replace(/\s/g,'');
+                const modelText=norm(valueOf(cells.get('E'+row))).replace(/\s/g,'');
+                const model=/^(mau)?m?3$/.test(modelText)?'M3':/^(mau)?m?4$/.test(modelText)?'M4':null;
+                if(!/^\d{12}$/.test(value)||!model){result.push({cccd:value,model:model||'',hoTen:valueOf(cells.get('B'+row)),sourceRow:row,sheet:sheet.getAttribute('name'),status:'Dữ liệu Excel không hợp lệ',reason:!model?'Không nhận diện được mẫu tại cột E':'CCCD không đủ 12 chữ số; cần kiểm tra lại dữ liệu nguồn'});continue;}
+                const key=model+'|'+value;
+                if(!seen.has(key)){seen.add(key);result.push({cccd:value,model,hoTen:valueOf(cells.get('B'+row)),sourceRow:row,sheet:sheet.getAttribute('name')});}
+                else result.find(x=>x.model===model&&x.cccd===value).sourceRows=(result.find(x=>x.model===model&&x.cccd===value).sourceRows||[result.find(x=>x.model===model&&x.cccd===value).sourceRow]).concat(row);
+            }
+        }
+        if(!result.length)throw new Error('Không có dữ liệu hợp lệ: CCCD cột C, mẫu M3/M4 cột E.');
+        return result;
+    }
+
+    async function importCccdExcel(event) {
+        if(isActive()) { showBatchBubble('Đang chạy','Bấm DỪNG trước khi nạp Excel.','warn');event.target.value='';return; }
+        const file=event.target.files?.[0]; if(!file)return;
+        try {
+            showStatus('Đang đọc CCCD từ Excel...');
+            const items=await readCccdXlsx(file);
+            setJson(KEY_EXCEL_QUEUE,{file:file.name,items,index:0});
+            updateExcelQueueLabel();
+            showBatchBubble('Đã nạp Excel',`${items.length} CCCD theo mẫu · tất cả sheet · cột C/E. Chọn khoảng ngày trên cổng, rồi bấm CHẠY EXCEL.`,'ok',7000);
+        } catch(e) { showBatchBubble('Không nạp được Excel',e.message,'error',8000); }
+        event.target.value='';
+    }
+
+    function updateExcelQueueLabel() {
+        const q=getJson(KEY_EXCEL_QUEUE,null),el=document.getElementById('m3cls-excel-label');
+        if(el)el.textContent=q?`${q.file} · ${Math.min(q.index,q.items.length)}/${q.items.length} CCCD`:'Excel: CCCD cột C · mẫu M3/M4 cột E';
+    }
+
+    function getExcelListCandidates(model = getCurrentModel()) {
+        if (model === 'M4') {
+            return getM4RowCandidates().map(x => ({ c: x.c, action: x.actionCell, row: x.row }));
+        }
+        // M3 phải dùng đúng nút cây viết/Xử lý như luồng AUTO M3 cũ.
+        return findPencilLinks()
+            .map(link => ({ c: parseCaseFromPencil(link), action: link, row: link.closest?.('tr,[role="row"]') || null }))
+            .filter(x => x.c);
+    }
+
+    async function handleExcelList() {
+        const q=getJson(KEY_EXCEL_QUEUE,null);
+        if(!q||q.index>=q.items.length) {finishBatch('Đã duyệt hết CCCD của '+getCurrentModel()+'. Chuyển sang danh sách mẫu còn lại và bấm CHẠY EXCEL; kết quả được giữ chung.');return;}
+        const item=q.items[q.index];
+        if(item.model!==getCurrentModel() || ['Đã điền và lưu xong','Đã lưu - chưa có kết quả xét nghiệm','Không tìm thấy xét nghiệm','Không tìm thấy hồ sơ','Nhiều lượt khám - chưa tự chọn','Trùng kết quả xét nghiệm - chưa tự chọn','Không tự quyết được','Dữ liệu Excel không hợp lệ','Lỗi kỹ thuật - chưa hoàn tất','Chưa xác nhận tìm kiếm','Đã duyệt - có lượt cần kiểm tra'].includes(item.status)){q.index++;setJson(KEY_EXCEL_QUEUE,q);queueRun();return;}
+
+        // Sau khi lưu ca trước và quay về danh sách, Medinet thường đã đổi URL
+        // nhưng DevExtreme vẫn còn đang dựng lại bộ lọc. Không được coi việc
+        // chưa thấy input/nút Xem trong vài giây đầu là lỗi cấu hình.
+        showStatus(`Excel ${q.index+1}/${q.items.length} · chờ danh sách sẵn sàng để tìm CCCD ${item.cccd}...`);
+        const controls = await waitFor(() => {
+            if (!isActive() || !isListPage()) return null;
+            const input=[...document.querySelectorAll('input[name="KSKDK_DinhDanhCaNhan"], input[id$="_KSKDK_DinhDanhCaNhan"]')].find(isVisibleElement);
+            const button=[...document.querySelectorAll('button,.dx-button,a')].find(el=>isVisibleElement(el)&&norm(el.textContent)==='xem');
+            if (input && button && !isListLoading()) return { input, button };
+            showStatus(`Medinet đang tải lại danh sách/bộ lọc · chờ trước khi tìm CCCD ${item.cccd}...`);
+            return null;
+        }, 30000, 250);
+
+        if (!isActive()) return;
+        if (!controls) {
+            // Không dừng batch. Trang có thể render lỗi/chậm; F5 an toàn rồi
+            // tiếp tục đúng CCCD hiện tại, không tăng index Excel.
+            showStatus(`Danh sách chưa render đủ bộ lọc sau 30 giây · đang tự tải lại, vẫn giữ CCCD ${item.cccd}...`);
+            await requestSafeReload('Danh sách chưa render đủ bộ lọc để chạy Excel', 1000);
+            return;
+        }
+
+        const { input, button } = controls;
+        showStatus(`Excel ${q.index+1}/${q.items.length} · tìm CCCD ${item.cccd}...`);
+        // Gỡ họ tên cũ để không giao hai điều kiện tìm kiếm khác người.
+        for(const other of [...document.querySelectorAll('input')].filter(el => /HoTen$/i.test(el.name || el.id) || norm(el.closest('.dx-textbox')?.textContent || '') === 'ho va ten')) {
+            if(isVisibleElement(other)){nativeInputSetter.call(other,'');other.dispatchEvent(new Event('input',{bubbles:true}));other.dispatchEvent(new Event('change',{bubbles:true}));}
+        }
+        const widget=input.closest('.dx-textbox');
+        try { const inst=window.DevExpress?.ui?.dxTextBox?.getInstance(widget); if(inst)inst.option('value',item.cccd); }catch(_){}
+        nativeInputSetter.call(input,item.cccd); input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));input.blur();
+        const before = listSignature();
+        const seq=NET.seq; clickOnce(button);
+        let observedLoading=false, stableAt=0,lastSignature='', searchDiagnostic='Chưa đọc được bảng';
+        const ready=await waitFor(()=>{
+            if(isListLoading()){observedLoading=true;stableAt=0;searchDiagnostic='Bộ nhận diện vẫn thấy lớp đang tải';return false;}
+            const model = getCurrentModel();
+            const candidates = getExcelListCandidates(model);
+            const total = getResultCount();
+            const exact = candidates.filter(x => String(x.c.cccd||'').replace(/\s/g,'') === item.cccd);
+            const records=[...NET.records.values()].filter(r=>r.id>seq);
+            const refreshed = observedLoading || before !== listSignature() ||
+                records.some(r=>r.done && r.status>=200 && r.status<400);
+            const currentInput = [...document.querySelectorAll('input[name="KSKDK_DinhDanhCaNhan"], input[id$="_KSKDK_DinhDanhCaNhan"]')].find(isVisibleElement);
+            const filterMatches = String(currentInput?.value || '').replace(/\s/g,'') === item.cccd;
+
+            // Medinet/DevExtreme có thể giữ row cũ trong DOM sau khi Xem.
+            // Chỉ tin các row đúng CCCD. Nếu bộ đếm báo N kết quả thì phải đọc
+            // được ít nhất N row đúng CCCD; row thừa khác CCCD được xem là stale.
+            const positiveReady = total === null ? exact.length > 0 : (total > 0 && exact.length >= total);
+            const emptyReady = total === 0 && exact.length === 0 && refreshed;
+            const valid = filterMatches && (positiveReady || emptyReady);
+            searchDiagnostic = `Dòng đọc được=${candidates.length}; tổng báo cáo=${total ?? 'không đọc được'}; đúng CCCD=${exact.length}; ô lọc khớp=${filterMatches}; đã tải lại=${refreshed}`;
+
+            if(!valid){stableAt=0;showStatus('Chờ xác nhận bảng · ' + searchDiagnostic);return false;}
+            const sig = JSON.stringify(exact.map(x => [caseKey(x.c),x.c.ngayKham])) + '|' + total;
+            if(sig!==lastSignature){lastSignature=sig;stableAt=Date.now();return false;}
+            if(!stableAt)stableAt=Date.now();
+            return Date.now()-stableAt>=800;
+        },30000,150);
+        if(!isActive())return;
+        if(!ready){skipExcelSearch(item,'Chưa xác nhận tìm kiếm','Chưa mở hồ sơ: ' + searchDiagnostic);return;}
+
+        const model=getCurrentModel();
+        const candidates=getExcelListCandidates(model);
+        let exact=candidates.filter(x=>String(x.c.cccd||'').replace(/\s/g,'')===item.cccd);
+        const total=getResultCount();
+
+        // Nếu DOM còn row stale, chỉ giữ đúng số lượng mà Medinet báo cho CCCD.
+        // Không bỏ ca chỉ vì DOM có row cũ khác CCCD.
+        if(total!==null && total>0 && exact.length < total){
+            skipExcelSearch(item,'Không tự quyết được',`Medinet báo ${total} kết quả nhưng chỉ đọc được ${exact.length} hồ sơ đúng CCCD; không tự chọn.`);return;
+        }
+        if(total!==null && total>0 && exact.length > total) exact = exact.slice(0,total);
+
+        const finished = new Set((item.visits || []).map(v => v.key));
+        const pending=exact.filter(x=>!finished.has(caseKey(x.c)));
+        const freshQueue = getJson(KEY_EXCEL_QUEUE, q);
+        freshQueue.items[freshQueue.index].plannedVisits = [...new Set([
+            ...(freshQueue.items[freshQueue.index].plannedVisits || []), ...exact.map(x => caseKey(x.c))
+        ])];
+        setJson(KEY_EXCEL_QUEUE, freshQueue);
+
+        if(!exact.length && !item.visits?.length){
+            await addSkipped({cccd:item.cccd,model,excelRow:item.sourceRow},'Không tìm thấy hồ sơ theo bộ lọc hiện tại trên cổng (khác với không tìm thấy xét nghiệm).','PROFILE_NOT_FOUND');
+            advanceCompletedExcelItem();
+            setCase(null); setStage(STAGE.LIST); queueRun(300); return;
+        }
+        if(!pending.length){finishExcelVisits();const updated=getJson(KEY_EXCEL_QUEUE,q);updated.index++;setJson(KEY_EXCEL_QUEUE,updated);updateExcelQueueLabel();queueRun();return;}
+
+        const chosen=pending[0];
+        chosen.c.startedAt=Date.now();
+        chosen.c.excelRow=item.sourceRow;
+        setCase(chosen.c);
+        setStage(STAGE.OPENING_CASE);
+        showStatus(`Đã tìm đúng CCCD ${item.cccd} · đang mở hồ sơ ${chosen.c.hoTen || ''} để AUTO CLS...`);
+
+        if(!await openCaseFromListAction(chosen.action,chosen.c))throw new Error('Không mở được hồ sơ theo CCCD Excel.');
+        const left=await waitFor(()=>!isListPage() || (model==='M4' && isM4DetailContext()),15000,150);
+        if(!left)throw new Error('Đã tìm thấy CCCD nhưng bấm Xử lý chưa mở được hồ sơ.');
+
+        // Từ đây trả hoàn toàn về luồng AUTO M3/M4 cũ:
+        // OPEN_CLS -> FILL_CLS -> SAVE_CLS -> Kết luận -> quay danh sách.
+        setStage(STAGE.OPEN_CLS);
+        showStatus(`Đã mở hồ sơ ${chosen.c.hoTen || item.cccd} · chuyển sang điền Cận lâm sàng...`);
+        queueRun(120);
+    }
+
+    async function startBatch(excelMode = false) {
+        // Không cho nút CHẠY M3/M4 reset ca và tắt Excel khi batch đang chạy.
+        if (isActive()) {
+            showStatus(sessionStorage.getItem(KEY_EXCEL_MODE) === '1'
+                ? 'AUTO EXCEL đang chạy · tự điền CLS và chuyển CCCD; không cần bấm CHẠY M3/M4.'
+                : 'AUTO CLS đang chạy.');
+            queueRun(100);
+            return;
+        }
+        excelMode = excelMode === true;
+        if (excelMode && !getJson(KEY_EXCEL_QUEUE, null)?.items?.length) { showBatchBubble("Chưa nạp Excel", "Nạp file .xlsx có CCCD ở C2:C trước.", "warn"); return; }
         const model = getCurrentModel();
         if (!model || !isListPage()) {
             showBatchBubble('Chưa đúng trang', 'Hãy mở DANH SÁCH M3 hoặc M4 và lọc “Chất lượng dữ liệu = Chưa có cận lâm sàng” trước khi bắt đầu.', 'warn', 6500);
@@ -1154,10 +1509,26 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             const proceed = await confirmBatchBubble(`Bộ lọc hiện là “${quality}”`, `AUTO CLS ${model} được thiết kế cho “Chưa có cận lâm sàng”. Ông vẫn muốn chạy?`, { type: 'warn', okText: 'VẪN CHẠY' });
             if (!proceed) return;
         }
-        const confirmed = await confirmBatchBubble(`Bắt đầu AUTO CLS ${model}?`, `Script sẽ tự lưu trên Medinet:\n1) Có XN: điền + lưu Cận lâm sàng\n2) Không có XN: vẫn lưu Cận lâm sàng trống\n3) Mở + lưu Kết luận\n4) Quay lại danh sách và tiếp tục ca kế\n\nChỉ chừa lại ca trùng hoặc dữ liệu không chắc chắn. Nên theo dõi kỹ vài ca đầu.`, { type: 'info', okText: `CHẠY ${model}` });
+        const confirmed = await confirmBatchBubble(`Bắt đầu AUTO CLS ${model}?`, `Script sẽ tự lưu trên Medinet:\n1) Có XN: điền + lưu Cận lâm sàng\n2) Không tìm thấy XN: ghi “Công dân chưa có kết quả xét nghiệm” vào mục Khác và lưu\n3) Mở + lưu Kết luận\n4) Quay lại danh sách và tiếp tục ca kế\n\nChỉ chừa lại ca trùng hoặc dữ liệu không chắc chắn. Nên theo dõi kỹ vài ca đầu.`, { type: 'info', okText: `CHẠY ${model}` });
         if (!confirmed) return;
 
+        sessionStorage.setItem(KEY_EXCEL_MODE, excelMode ? '1' : '0');
+        if (excelMode) {
+            const q = getJson(KEY_EXCEL_QUEUE, null);
+            const terminal = new Set(['Đã điền và lưu xong','Đã lưu - chưa có kết quả xét nghiệm','Không tìm thấy xét nghiệm','Không tìm thấy hồ sơ','Nhiều lượt khám - chưa tự chọn','Trùng kết quả xét nghiệm - chưa tự chọn','Không tự quyết được','Dữ liệu Excel không hợp lệ','Lỗi kỹ thuật - chưa hoàn tất','Chưa xác nhận tìm kiếm','Đã duyệt - có lượt cần kiểm tra']);
+            const next = q.items.findIndex(x => x.model === model && !terminal.has(x.status));
+            if(next < 0) { showBatchBubble('Không còn ca mới của '+model,'Các ca của mẫu này đã có kết quả. Xuất file kiểm tra hoặc nạp lại Excel để chạy lại.', 'info'); return; }
+            q.index = next;
+            setJson(KEY_EXCEL_QUEUE, q);
+            const imported = new Set(q.items.filter(x=>x.model===model&&!terminal.has(x.status)).map(x=>x.cccd));
+            const skipped = getLocalJson(KEY_SKIPPED, {});
+            for (const [key, x] of Object.entries(skipped)) if (x.c?.model===model&&imported.has(x.c?.cccd)) delete skipped[key];
+            setLocalJson(KEY_SKIPPED, skipped);
+        }
+        const savedDone = excelMode ? getLocalJson(KEY_DONE, {}) : null;
         resetRunState();
+        if (excelMode && getJson(KEY_EXCEL_QUEUE, null)?.index > 0 && savedDone) setLocalJson(KEY_DONE, savedDone);
+        updateExcelQueueLabel();
         safeReloadInFlight = false;
         saveStats({
             processed: 0, done: 0, skipped: 0,
@@ -1609,11 +1980,23 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         })[0] || null;
     }
 
+    async function openM3Case(action, c) {
+        // Dùng đúng bộ dò và cú bấm của AUTO M3 gốc đang hoạt động.
+        const matches = findPencilLinks().filter(link => {
+            const parsed = parseCaseFromPencil(link);
+            return parsed && sameCaseIdentity(parsed, c);
+        });
+        if (matches.length !== 1) throw new Error('M3: chưa xác định được nút sửa duy nhất của mã phiếu ' + (c.maPhieu || c.ngayKham));
+        showStatus('M3 · mở hồ sơ ' + c.hoTen + ' · ' + (c.maPhieu || c.ngayKham));
+        if (!robustClick(matches[0])) throw new Error('M3: không bấm được nút sửa hồ sơ.');
+        return !!await waitFor(() => !isListPage() && !isLikelyLoginPage(), 15000, 150);
+    }
+
     async function openCaseFromListAction(action, c) {
         const model = c?.model || getCurrentModel();
 
         if (model !== 'M4') {
-            return robustClick(action);
+            return await openM3Case(action, c);
         }
 
         // Không tin vào index cột Xử lý của M4. Tìm lại đúng dòng bằng CCCD/Họ tên,
@@ -1691,7 +2074,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         if (!a || !b) return false;
         const cccdA = String(a.cccd || '').replace(/\s/g, '');
         const cccdB = String(b.cccd || '').replace(/\s/g, '');
-        if (cccdA && cccdB) return cccdA === cccdB;
+        if (cccdA && cccdB) return cccdA === cccdB && (a.maPhieu && b.maPhieu ? a.maPhieu === b.maPhieu : sameDate(a.ngayKham, b.ngayKham));
         return norm(a.hoTen) === norm(b.hoTen) && sameDate(a.ngayKham, b.ngayKham);
     }
 
@@ -1805,6 +2188,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         };
 
         const readCase = indexes => ({
+            maPhieu: (cells[7]?.textContent || '').replace(/\s/g, ''),
             pageNumber: getCurrentPageNumber(),
             rowStt: (cells[0]?.textContent || '').trim(),
             hoTen: (cells[indexes.name]?.textContent || '').trim(),
@@ -1861,8 +2245,20 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
     }
 
     function getResultCount() {
-        const m = (document.body.innerText || '').match(/Có\s+(\d+)\s+kết quả/i);
-        return m ? parseInt(m[1], 10) : null;
+        const visibleCount = norm(document.body.innerText || '').match(/co\s+([\d.,]+)\s+ket qua/);
+        if (visibleCount) return Number(visibleCount[1].replace(/[.,]/g, ''));
+        // Chỉ dùng bộ đếm grid khi báo cáo không có số kết quả hiển thị.
+        for (const el of document.querySelectorAll('.dx-datagrid')) {
+            if (!isVisibleElement(el)) continue;
+            try {
+                const grid = window.DevExpress?.ui?.dxDataGrid?.getInstance(el);
+                const count = grid?.totalCount?.();
+                if (Number.isInteger(count) && count >= 0) return count;
+            } catch (_) {}
+        }
+        const text = document.body.innerText || '';
+        const m = text.match(/Có\s+([\d.,]+)\s+kết quả/i) || text.match(/tổng(?: số)?\s*:?\s*([\d.,]+)\s*(?:kết quả|bản ghi|hồ sơ)/i);
+        return m ? Number(m[1].replace(/[.,]/g, '')) : null;
     }
 
     function getVisibleListCaseCount(model = getCurrentModel()) {
@@ -3224,6 +3620,36 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         return { filled: true };
     }
 
+    function findClsOtherInput(scope = null) {
+        const direct = [...document.querySelectorAll('.NuocTieu_Khac input.dx-texteditor-input, .NuocTieu_Khac input[type="text"]')]
+            .find(el => isVisibleElement(el) && isInScope(el, scope));
+        if (direct) return direct;
+
+        const labels = findLabelElements('Khác')
+            .filter(el => isVisibleElement(el) && isInScope(el, scope));
+        for (const label of labels) {
+            const field = label.closest('.dx-field-item, .h-item, .formControlDefault') || label.parentElement;
+            const input = field?.querySelector?.('input.dx-texteditor-input, input[type="text"]');
+            if (input && isVisibleElement(input)) return input;
+        }
+        return null;
+    }
+
+    async function setClsOtherText(text, scope = null) {
+        const input = await waitFor(() => findClsOtherInput(scope), 10000, 100);
+        if (!input) throw new Error('Không tìm thấy ô Khác (nếu có) trong phần CLS.');
+        await setCommittedEditorValue(input, text, text);
+        const ok = await waitFor(() => String(input.value || '').trim() === text, 2500, 80);
+        if (!ok) throw new Error('Đã điền ô Khác nhưng Medinet chưa giữ nội dung.');
+        return true;
+    }
+
+    async function verifyClsOtherText(text, scope = null, timeoutMs = 8000) {
+        const input = await waitFor(() => findClsOtherInput(scope), timeoutMs, 100);
+        if (!input) return false;
+        return String(input.value || '').trim() === text;
+    }
+
     function resolveClsScope() {
         let scope = getDinhKyScope();
         if (scope) return scope;
@@ -3628,20 +4054,54 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
 
     async function skipCurrent(reason, type) {
         const c = getCase();
-        warn('SKIP:', c, reason);
         removeDeferred(c);
         await addSkipped(c, reason, type);
-        setStage(STAGE.RETURN_LIST);
-        if (!isListPage()) await goBackToList();
+        setStage(STAGE.SKIP_RETURN);
+        await handleSkipReturn();
+    }
+
+    async function handleSkipReturn() {
+        if (!isActive()) return;
+        if (!isListPage()) {
+            const listUrl = sessionStorage.getItem(KEY_LIST_URL);
+            if (listUrl) { location.href = listUrl; return; }
+            if (!await goBackToList()) throw new Error('Chưa quay lại được danh sách sau khi bỏ qua.');
+        }
+        advanceCompletedExcelItem();
         setCase(null);
         setStage(STAGE.LIST);
-        await sleep(300);
-        queueRun();
+        queueRun(500);
+    }
+
+    function skipExcelSearch(item, status, reason) {
+        recordExcelOutcome(item, status, reason);
+        const q = getJson(KEY_EXCEL_QUEUE, null);
+        if (q && q.items[q.index]?.cccd === item.cccd) {
+            q.index++;
+            setJson(KEY_EXCEL_QUEUE, q);
+        }
+        setCase(null);
+        setStage(STAGE.LIST);
+        updateExcelQueueLabel();
+        showStatus(status + ' · chuyển CCCD tiếp theo');
+        queueRun(500);
     }
 
     async function failCurrent(reason) {
         const c = getCase();
+        recordExcelOutcome(c, 'Lỗi kỹ thuật - chưa hoàn tất', reason);
         const stage = getStage();
+        if (stage === STAGE.SKIP_RETURN) {
+            showStatus('Đang quay lại danh sách; giữ nguyên kết quả bỏ qua...');
+            queueRun(1500);
+            return;
+        }
+        if (sessionStorage.getItem(KEY_EXCEL_MODE) === '1') {
+            if (c) { await skipCurrent(reason, 'INVALID'); return; }
+            const q = getJson(KEY_EXCEL_QUEUE, null);
+            const item = q?.items?.[q.index];
+            if (item) { skipExcelSearch(item, 'Lỗi kỹ thuật - chưa hoàn tất', reason); return; }
+        }
 
         // Lỗi cấp trang khi chưa có ca: tự chờ/F5 vô hạn, không tắt batch.
         if (!c) {
@@ -3723,6 +4183,9 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
     async function handleList() {
         const modelNow = getCurrentModel();
         if (isListPage()) sessionStorage.setItem(KEY_LIST_URL, location.href);
+        // Excel cũng phải đi qua cổng chờ danh sách ổn định. Trước đây nhánh
+        // Excel được gọi ngay khi URL vừa về list, sớm hơn lúc DevExtreme dựng
+        // xong bộ lọc nên có thể báo nhầm "không thấy Định danh/nút Xem".
         showStatus(`Đang chờ Medinet tải xong danh sách ${modelNow || ''}...`);
 
         const pageReady = await waitForPageReadyOrReload(
@@ -3731,6 +4194,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             createStableListReadyCheck()
         );
         if (!pageReady) return;
+        if (sessionStorage.getItem(KEY_EXCEL_MODE) === '1') { await handleExcelList(); return; }
 
         if (sessionStorage.getItem(KEY_FORCE_PAGE_ONE) === '1') {
             showStatus('Danh sách đã làm mới · đang quay về trang 1 để quét tiếp...');
@@ -3933,7 +4397,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             .map(link => ({ link, c: parseCaseFromPencil(link) }))
             .find(x => x.c && sameCaseIdentity(x.c, c));
         if (!match) throw new Error(`M3: không tìm lại được nút Xử lý của ${c.hoTen}.`);
-        robustClick(match.link);
+        await openCaseFromListAction(match.link, c);
         const leftList = await waitFor(() => !isListPage(), 12000, 180);
         if (!leftList) throw new Error(`M3: bấm Xử lý nhưng chưa mở hồ sơ ${c.hoTen}.`);
         setStage(STAGE.OPEN_CLS);
@@ -3970,16 +4434,16 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         showStatus(`Tìm XN: ${c.hoTen} · ngày XN ${c.ngayKham}`);
         const match = await findLabForCase(c);
         if (match.status === 'NOT_FOUND') {
-            // Theo quy trình: ca không có kết quả xét nghiệm vẫn phải bấm Lưu
-            // Cận lâm sàng và tiếp tục Lưu Kết luận. Chỉ SKIP khi có nhiều
-            // kết quả hoặc dữ liệu không đủ chắc chắn để tự chọn.
-            c.noLab = true;
+            showStatus('Không có kết quả XN · đang ghi ghi chú vào mục Khác của CLS...');
+            const scope = resolveClsScope();
+            await setClsOtherText(NO_LAB_RESULT_NOTE, scope);
+            c.noLabResult = true;
+            c.noLabNote = NO_LAB_RESULT_NOTE;
             c.sid = '';
-            // Cờ này chỉ tồn tại trong ca đang chạy để bỏ qua bước chờ lệnh
-            // điền. Không đưa ca không có XN vào SKIP/ERROR/báo cáo.
+            c.fillReport = { filled: 0, missing: [], notFound: [], sid: '', noLabResult: true };
+            c.clsExpectedData = {};
             setCase(c);
             setStage(STAGE.SAVE_CLS);
-            showStatus('Không có XN · vẫn chuẩn bị lưu Cận lâm sàng trống...');
             queueRun();
             return;
         }
@@ -4030,31 +4494,34 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             return;
         }
 
-        if (c.noLab) {
-            showStatus('Không có XN · chuẩn bị lưu Cận lâm sàng trống...');
-        } else {
+        {
             showStatus('Đang kiểm tra lần cuối toàn bộ CLS trước khi lưu...');
-            const expected = c.clsExpectedData || {};
-            if (Object.keys(expected).length < 5) {
-                setStage(STAGE.FILL_CLS);
-                showStatus('Thiếu dữ liệu đối chiếu trước khi lưu · đang đọc và điền lại CLS...');
-                queueRun(300);
-                return;
-            }
             const scope = resolveClsScope();
-            const finalStable = await waitForFilledClsValuesStable(scope, expected, 500, 120000);
-            if (!finalStable.ok) {
-                if (finalStable.hidden) {
-                    showStatus('Tab đang ẩn · chưa lưu CLS...');
-                    queueRun(1000);
+            if (c.noLabResult) {
+                const noteOk = await verifyClsOtherText(c.noLabNote || NO_LAB_RESULT_NOTE, scope, 8000);
+                if (!noteOk) {
+                    await setClsOtherText(c.noLabNote || NO_LAB_RESULT_NOTE, scope);
+                }
+            } else {
+                const expected = c.clsExpectedData || {};
+                if (Object.keys(expected).length < 5) {
+                    setStage(STAGE.FILL_CLS);
+                    showStatus('Thiếu dữ liệu đối chiếu trước khi lưu · đang đọc và điền lại CLS...');
+                    queueRun(300);
                     return;
                 }
-                // Không lưu một form còn thiếu/đang render. Quay lại bước điền
-                // để nạp lại dữ liệu nguồn và kiểm tra toàn bộ lần nữa.
-                setStage(STAGE.FILL_CLS);
-                showStatus(`CLS chưa giữ đủ giá trị${finalStable.unstable?.length ? `: ${finalStable.unstable.join(', ')}` : ''} · đang điền lại...`);
-                queueRun(300);
-                return;
+                const finalStable = await waitForFilledClsValuesStable(scope, expected, 500, 120000);
+                if (!finalStable.ok) {
+                    if (finalStable.hidden) {
+                        showStatus('Tab đang ẩn · chưa lưu CLS...');
+                        queueRun(1000);
+                        return;
+                    }
+                    setStage(STAGE.FILL_CLS);
+                    showStatus(`CLS chưa giữ đủ giá trị${finalStable.unstable?.length ? `: ${finalStable.unstable.join(', ')}` : ''} · đang điền lại...`);
+                    queueRun(300);
+                    return;
+                }
             }
         }
 
@@ -4113,18 +4580,13 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             ? 'DETAIL_SHELL'
             : (settled.fullReload ? 'FULL_RELOAD' : 'SPA_RENDER');
         setCase(c);
-        setStage(c.noLab ? STAGE.OPEN_CONCLUSION : STAGE.VERIFY_CLS_SAVED);
+        setStage(STAGE.VERIFY_CLS_SAVED);
         queueRun();
     }
 
     async function handleVerifyClsSaved() {
         const c = getCase();
         if (!c) throw new Error('Mất thông tin ca khi kiểm tra CLS sau lưu.');
-        if (c.noLab) {
-            setStage(STAGE.OPEN_CONCLUSION);
-            queueRun();
-            return;
-        }
         if (document.hidden) {
             showStatus('Tab đang ẩn · chờ kiểm tra CLS sau lưu...');
             queueRun(1000);
@@ -4139,7 +4601,9 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         const expected = c.clsExpectedData || {};
         const scope = resolveClsScope();
         showStatus('Đang đối chiếu lại CLS sau khi Medinet đã lưu/render...');
-        const verified = await waitForFilledClsValuesStable(scope, expected, 700, 15000);
+        const verified = c.noLabResult
+            ? { ok: await verifyClsOtherText(c.noLabNote || NO_LAB_RESULT_NOTE, scope, 15000), unstable: ['Khác (nếu có)'] }
+            : await waitForFilledClsValuesStable(scope, expected, 700, 15000);
         if (verified.ok) {
             c.clsPostSaveVerified = true;
             c.clsPostSaveVerifiedAt = Date.now();
@@ -4153,7 +4617,12 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         c.clsPostSaveRepairAttempts = Number(c.clsPostSaveRepairAttempts || 0) + 1;
         setCase(c);
         if (c.clsPostSaveRepairAttempts <= 2) {
-            setStage(STAGE.FILL_CLS);
+            if (c.noLabResult) {
+                await setClsOtherText(c.noLabNote || NO_LAB_RESULT_NOTE, scope);
+                setStage(STAGE.SAVE_CLS);
+            } else {
+                setStage(STAGE.FILL_CLS);
+            }
             showStatus(
                 `CLS sau lưu còn mất giá trị${verified.unstable?.length ? `: ${verified.unstable.join(', ')}` : ''} ` +
                 `· đang điền và lưu lại lần ${c.clsPostSaveRepairAttempts}/2...`
@@ -4237,9 +4706,10 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         const c = getCase();
         if (!c) throw new Error('Mất ca vừa lưu Kết luận.');
 
-        // Ca không có XN được xem như ca hoàn tất bình thường. Xóa cờ nội bộ
-        // trước khi lưu DONE để không tạo log riêng cho nhóm này.
-        if (c.noLab) delete c.noLab;
+        if (!c.clsPostSaveVerified || !c.conclusionSaveConfirmed) {
+            await skipCurrent('CLS hoặc lưu Kết luận chưa được xác nhận thành công; cần kiểm tra hồ sơ.', 'INVALID');
+            return;
+        }
         removeDeferred(c);
         await addDone(c);
         const s = getStats();
@@ -4251,6 +4721,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         }
         saveStats(s);
         log('DONE SAVED:', c.hoTen, c.cccd, c.sid || '');
+        advanceCompletedExcelItem();
         setCase(null);
         setStage(STAGE.LIST);
         await sleep(350);
@@ -4268,6 +4739,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
     }
 
     function finishBatch(message) {
+        if (sessionStorage.getItem(KEY_EXCEL_MODE) === '1') exportExcelQueue(true);
         setActive(false);
         hideStatus();
         updatePanel();
@@ -4302,7 +4774,8 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
                 queueRun(30000);
                 return;
             }
-            if (stage === STAGE.LIST) await handleList();
+            if (stage === STAGE.SKIP_RETURN) await handleSkipReturn();
+            else if (stage === STAGE.LIST) await handleList();
             else if (stage === STAGE.OPENING_CASE) await handleOpeningCase();
             else if (stage === STAGE.OPEN_CLS) await handleOpenCls();
             else if (stage === STAGE.FILL_CLS) await handleFillCls();
@@ -4422,7 +4895,6 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             sessionStorage.setItem(KEY_RUNTIME_VERSION, SCRIPT_VERSION);
         }
         rememberDetectedModel();
-        releaseLegacyNotFoundSkips();
         releaseLegacyTechnicalSkips();
         installNetworkTracker();
         ensurePanel();
