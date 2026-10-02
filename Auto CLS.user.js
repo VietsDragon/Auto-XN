@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.3.21
-// @description  Tự nhận diện M3/M4: có XN thì điền và lưu CLS; chưa có XN thì ghi nhận tại mục Khác; lưu Kết luận và nhật ký Excel.
+// @version      2.3.24
+// @description  Tự nhận diện M3/M4: điền/lưu/đối chiếu CLS, sửa lưu âm tính nước tiểu; chưa có XN ghi mục Khác; lưu Kết luận và nhật ký Excel.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
 // @run-at       document-idle
@@ -25,7 +25,7 @@
     // - Lỗi kỹ thuật => thử nhanh, gác tạm theo cooldown, rồi tự quay lại; không tự dừng batch.
     // - Không tự đoán kết quả xét nghiệm.
 
-    const SCRIPT_VERSION = '2.3.21';
+    const SCRIPT_VERSION = '2.3.24';
     const LOG = '[AUTO CLS SMART BATCH]';
 
     // =====================================================================
@@ -108,6 +108,8 @@
     // Mẫu hiện tại được ghi nhớ theo tab để khi từ danh sách đi vào hồ sơ
     // URL chi tiết vẫn biết chính xác đang chạy M3 hay M4.
     const KEY_MODEL = 'm34_cls_smart_model_v200';
+    const KEY_MODEL_PERSIST = 'm34_cls_smart_model_persist_v2322';
+    const KEY_HOME_RECOVERY = 'm34_cls_home_recovery_v2322';
 
     const MODEL_ROUTE = {
         M3_LIST: ['KSKDK_DanhSach_KSK_M13', 'KSKDK_DanhSach_KSK_M3'],
@@ -137,12 +139,17 @@
 
     function rememberDetectedModel() {
         const detected = detectModelFromLocation();
-        if (detected) sessionStorage.setItem(KEY_MODEL, detected);
+        if (detected) {
+            sessionStorage.setItem(KEY_MODEL, detected);
+            try { localStorage.setItem(KEY_MODEL_PERSIST, detected); } catch (_) {}
+        }
         return detected;
     }
 
     function getCurrentModel() {
-        return rememberDetectedModel() || sessionStorage.getItem(KEY_MODEL) || '';
+        let persisted = '';
+        try { persisted = localStorage.getItem(KEY_MODEL_PERSIST) || ''; } catch (_) {}
+        return rememberDetectedModel() || sessionStorage.getItem(KEY_MODEL) || persisted || '';
     }
 
     function getModelLabel() {
@@ -1861,25 +1868,56 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         const listUrl = sessionStorage.getItem(KEY_LIST_URL) || '';
         if (MODEL_ROUTE.M4_LIST.some(x => listUrl.includes(x))) return 'M4';
         if (MODEL_ROUTE.M3_LIST.some(x => listUrl.includes(x))) return 'M3';
+        try {
+            const persisted = localStorage.getItem(KEY_MODEL_PERSIST);
+            if (persisted === 'M3' || persisted === 'M4') return persisted;
+        } catch (_) {}
         return '';
     }
 
-    function isLikelyPortalHomePage() {
-        if (isLikelyLoginPage() || isListPage() || isClsPage() || isConclusionPage()) return false;
-        const path = String(location.pathname || '').replace(/\/+$/, '').toLowerCase();
-        const href = String(location.href || '').toLowerCase();
+    function isKnownWorkflowPage() {
+        if (isLikelyLoginPage()) return true;
+        if (isListPage() || isClsPage() || isConclusionPage()) return true;
+        if (isM4DetailContext()) return true;
+        const u = String(location.href || '');
+        // M3 detail route thay đổi giữa các phiên bản; nếu đang có ca và trang có
+        // các heading/field đặc hiệu của hồ sơ thì không coi là Home.
+        const body = norm(document.body?.innerText || '');
+        if (getCase() && (
+            body.includes('thong tin doi tuong kham') ||
+            body.includes('kham can lam sang') ||
+            body.includes('ket luan') ||
+            body.includes('xet nghiem mau') ||
+            body.includes('xet nghiem nuoc tieu')
+        )) return true;
+        return false;
+    }
 
-        // Các route Home thường gặp của shell Medinet. Chỉ bắt route Home/main,
-        // không coi mọi trang lạ là Home để tránh kéo ngược khi trang chi tiết đang render.
+    function isLikelyPortalHomePage() {
+        if (isKnownWorkflowPage()) return false;
+        const href = String(location.href || '').toLowerCase();
+        const path = String(location.pathname || '').replace(/\/+$/, '').toLowerCase();
+
+        // 1) Các route Home thường gặp.
         if (path === '/app/main' || path === '/app/main/home' || path === '/app/main/dashboard') return true;
         if (/\/app\/main\/(home|dashboard)(?:[/?#]|$)/i.test(href)) return true;
 
-        // Dự phòng cho SPA giữ nguyên /app/main nhưng đổi hash.
-        if (/\/app\/main(?:[/?#]|$)/i.test(href) && !href.includes('/dynamicreport/report/viewer-utility/')) {
-            const body = norm(document.body?.innerText || '');
-            const looksHome = body.includes('trang chu') || body.includes('homepage') || body.includes('dashboard');
-            const hasWorkflowShell = !!findSidebarItemByText(['Khám cận lâm sàng', 'Cận lâm sàng', 'Kết luận', 'Kết luận khám']);
-            if (looksHome && !hasWorkflowShell) return true;
+        // 2) v2.3.23: chỉ dùng guard "route lạ trong /app/main" khi đang ở
+        // LIST / chưa có ca. Khi vừa bấm chọn bệnh nhân, Medinet chuyển sang route
+        // chi tiết trước rồi Angular mới render nội dung. Nếu coi mọi route lạ là
+        // Home ngay lập tức, watchdog sẽ giật ngược về M3/M4 trước khi hồ sơ kịp mở.
+        //
+        // Với ca đang xử lý (OPENING_CASE -> RETURN_LIST), chỉ các route Home rõ
+        // ràng ở mục (1) mới được phục hồi cưỡng bức. Route chi tiết chưa nhận diện
+        // sẽ được state machine chờ/render/xác minh theo stage hiện tại.
+        const stage = getStage();
+        const hasCurrentCase = !!getCase();
+        const mayUseGenericShellGuard = stage === STAGE.LIST || !hasCurrentCase;
+        if (isActive() && mayUseGenericShellGuard && href.includes('/app/main')) {
+            if (!MODEL_ROUTE.M3_LIST.some(x => href.includes(x.toLowerCase())) &&
+                !MODEL_ROUTE.M4_LIST.some(x => href.includes(x.toLowerCase()))) {
+                return true;
+            }
         }
         return false;
     }
@@ -1888,21 +1926,28 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         const model = getRecoveryModel();
         const target = CANONICAL_LIST_URL[model];
         if (!target) {
-            showStatus('Medinet về trang chủ nhưng chưa xác định được phiên M3/M4 · giữ nguyên tiến trình.');
-            queueRun(5000);
+            showStatus('Medinet bị lạc về trang ngoài luồng nhưng chưa xác định được phiên M3/M4 · giữ nguyên tiến trình.');
+            queueRun(3000);
             return true;
         }
 
-        // Không tăng q.index: Excel mode sẽ tìm lại đúng CCCD hiện tại.
-        // Nếu ca đang dở, quay về LIST và làm lại ca đó từ đầu an toàn hơn việc
-        // tiếp tục một stage chi tiết khi DOM hồ sơ đã mất.
+        // Không tăng q.index. Sau khi trở lại danh sách, Excel mode sẽ tìm lại
+        // đúng CCCD hiện tại. Reset stage chi tiết vì DOM hồ sơ đã mất.
         setCase(null);
         setStage(STAGE.LIST);
         sessionStorage.setItem(KEY_LIST_URL, target);
         sessionStorage.setItem(KEY_MODEL, model);
-        touchHeartbeat(`HOME_RECOVERY:${model}`);
-        showStatus(`Medinet bị đưa về Trang chủ · tự vào lại danh sách ${model} và tiếp tục phiên hiện tại...`);
-        location.replace(target);
+        try { localStorage.setItem(KEY_MODEL_PERSIST, model); } catch (_) {}
+
+        const prev = getJson(KEY_HOME_RECOVERY, { attempts: 0, lastAt: 0 });
+        const attempts = Number(prev.attempts || 0) + 1;
+        setJson(KEY_HOME_RECOVERY, { attempts, lastAt: Date.now(), model, from: location.href, target });
+        touchHeartbeat(`HOME_RECOVERY:${model}:${attempts}`);
+        showStatus(`Medinet bị đưa ra ngoài luồng · đang trở lại danh sách ${model} (lần ${attempts})...`);
+
+        // Dùng assign thay replace. Một số lần shell Angular tự replaceState về Home
+        // ngay sau bootstrap; assign tạo navigation mới tới đúng route người dùng cung cấp.
+        window.location.assign(target);
         return true;
     }
 
@@ -3712,7 +3757,11 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
 
     function isNegativeDisplayedValue(raw) {
         const shown = norm(raw);
-        return shown.includes('negative') || shown.includes('am tinh');
+        const n = parseNumberLoose(raw);
+        // Medinet có thể render kết quả âm tính dưới dạng chữ Negative/Âm tính
+        // hoặc giữ đúng số 0. Cả ba đều là cùng một giá trị hợp lệ.
+        return (Number.isFinite(n) && n === 0) ||
+            shown.includes('negative') || shown.includes('am tinh');
     }
 
     function getAngularControlComponent(input) {
@@ -3805,31 +3854,65 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
     async function setNegativeQualitative(inputInfo) {
         const input = inputInfo?.element;
         if (!input) return '';
-        const isNegativeDisplay = () => isNegativeDisplayedValue(input.value || '');
 
         CLS_WRITES.pending++;
         try {
-            // Không ghi model = 0: hnumberbox của Medinet coi 0 là rỗng khi
-            // serialize. Gõ từng ký tự như người dùng và đẩy chuỗi Negative
-            // qua ControlValueAccessor/Angular model nếu runtime cho phép.
-            await typeNegativeLikeUser(input);
-            if (!isNegativeDisplay()) {
-                pushNegativeIntoAngularModel(input);
-                nativeInputSetter.call(input, 'Negative');
-                input.dispatchEvent(new InputEvent('input', {
-                    bubbles: true, inputType: 'insertText', data: 'Negative'
-                }));
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                await sleep(120);
+            // v2.3.24: không ghi chuỗi "Negative" vào hnumberbox nữa. Một số hồ sơ
+            // hiển thị Negative trước khi Lưu nhưng payload backend lại bỏ giá trị này,
+            // nên khi mở lại các ô LEU/BLD/PRO/GLU/KET/BIL/URO trở thành trống.
+            // Portal chấp nhận 0 là kết quả âm tính (placeholder: "Negative hoặc nhập số").
+            // Ghi 0 vào state DevExtreme + Angular/model + input/hidden để payload Lưu có
+            // giá trị thực, không chỉ có chữ hiển thị trên màn hình.
+            const editor = getDevExtremeEditor(input);
+            let committed = false;
+            if (editor?.instance?.option) {
+                try {
+                    editor.instance.option('value', 0);
+                    committed = true;
+                } catch (_) {}
             }
+
+            const component = getAngularControlComponent(input);
+            if (component) {
+                for (const prop of ['value', 'model', 'ngModel', 'inputValue']) {
+                    try { if (prop in component) component[prop] = 0; } catch (_) {}
+                }
+                for (const method of ['writeValue', 'onChange', '_onChange', 'propagateChange']) {
+                    try { if (typeof component[method] === 'function') component[method](0); } catch (_) {}
+                }
+                for (const emitter of ['valueChange', 'modelChange', 'ngModelChange', 'change']) {
+                    try { if (typeof component[emitter]?.emit === 'function') component[emitter].emit(0); } catch (_) {}
+                }
+                try { component.changeDetectorRef?.detectChanges?.(); } catch (_) {}
+                try { component.cdr?.detectChanges?.(); } catch (_) {}
+            }
+
+            input.focus();
+            try { input.select(); } catch (_) {}
+            nativeInputSetter.call(input, '0');
+            input.dispatchEvent(new InputEvent('input', {
+                bubbles: true, inputType: 'insertText', data: '0'
+            }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.blur();
+            input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
 
             const host = input.closest?.('hnumberbox,.dx-numberbox,dx-number-box');
             for (const hidden of host?.querySelectorAll?.('input[type="hidden"]') || []) {
-                hidden.value = 'Negative';
+                hidden.value = '0';
                 hidden.dispatchEvent(new Event('input', { bubbles: true }));
                 hidden.dispatchEvent(new Event('change', { bubbles: true }));
             }
-            return isNegativeDisplay() ? input.value : '';
+
+            await sleep(180);
+            const widgetValue = editor?.instance?.option ? editor.instance.option('value') : input.value;
+            const ok = isNegativeDisplayedValue(input.value || '') ||
+                (Number.isFinite(Number(widgetValue)) && Number(widgetValue) === 0);
+            if (!ok && !committed) {
+                // Fallback cuối: dùng helper chung để phát đủ event nếu control portal khác loại.
+                await dispatchInputValue(input, '0');
+            }
+            return isNegativeDisplayedValue(input.value || '') ? input.value : '0';
         } finally {
             CLS_WRITES.pending = Math.max(0, CLS_WRITES.pending - 1);
             CLS_WRITES.completed++;
@@ -4100,10 +4183,25 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
                 const requiresNegativeText =
                     QUALITATIVE_URINE_COLUMNS.includes(f.column) &&
                     isNegativeUrineValue(raw);
+                let valueMatches = true;
+                if (requiresNegativeText) {
+                    valueMatches = isNegativeDisplayedValue(displayed) ||
+                        (Number.isFinite(Number(widgetValue)) && Number(widgetValue) === 0);
+                } else {
+                    const expectedNum = parseNumberLoose(raw);
+                    const shownNum = parseNumberLoose(displayed);
+                    const widgetNum = parseNumberLoose(widgetValue);
+                    if (Number.isFinite(expectedNum)) {
+                        valueMatches =
+                            (Number.isFinite(shownNum) && Math.abs(shownNum - expectedNum) < 0.000001) ||
+                            (Number.isFinite(widgetNum) && Math.abs(widgetNum - expectedNum) < 0.000001);
+                    } else {
+                        valueMatches = norm(displayed) === norm(raw) || norm(String(widgetValue ?? '')) === norm(raw);
+                    }
+                }
                 if (
                     !input || !input.isConnected || !isVisibleElement(input) ||
-                    !displayed || !widgetHasValue ||
-                    (requiresNegativeText && !isNegativeDisplayedValue(displayed))
+                    !displayed || !widgetHasValue || !valueMatches
                 ) {
                     unstable.push(f.label);
                 } else {
@@ -4507,7 +4605,11 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
 
     async function handleList() {
         const modelNow = getCurrentModel();
-        if (isListPage()) sessionStorage.setItem(KEY_LIST_URL, location.href);
+        if (isListPage()) {
+            sessionStorage.setItem(KEY_LIST_URL, location.href);
+            sessionStorage.removeItem(KEY_HOME_RECOVERY);
+            rememberDetectedModel();
+        }
         // Excel cũng phải đi qua cổng chờ danh sách ổn định. Trước đây nhánh
         // Excel được gọi ngay khi URL vừa về list, sớm hơn lúc DevExtreme dựng
         // xong bộ lọc nên có thể báo nhầm "không thấy Định danh/nút Xem".
@@ -4955,7 +5057,7 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         showStatus('Đang đối chiếu lại CLS sau khi Medinet đã lưu/render...');
         const verified = c.noLabResult
             ? { ok: await verifyClsOtherText(c.noLabNote || NO_LAB_RESULT_NOTE, scope, 15000), unstable: ['Khác (nếu có)'] }
-            : await waitForFilledClsValuesStable(scope, expected, 700, 15000);
+            : await waitForFilledClsValuesStable(scope, expected, 1500, 25000);
         if (verified.ok) {
             c.clsPostSaveVerified = true;
             c.clsPostSaveVerifiedAt = Date.now();
@@ -5286,6 +5388,12 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         ensurePanel();
         installNavigationWatcher();
         installRecoveryWatchdog();
+        // Guard nhanh: nếu Medinet tự đá về shell/Home sau F5 mà không phát sinh
+        // navigation event rõ ràng, kiểm tra mỗi 2 giây và kéo về đúng danh sách.
+        setInterval(() => {
+            if (!isActive() || document.hidden || isLikelyLoginPage()) return;
+            if (isLikelyPortalHomePage()) recoverFromPortalHome();
+        }, 2000);
         setInterval(() => { if (isActive()) updatePanel(); }, 1000);
         document.addEventListener('visibilitychange', () => {
             updatePanel();
