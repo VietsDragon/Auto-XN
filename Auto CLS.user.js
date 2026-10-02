@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto CLS M3/M4 Smart Batch
 // @namespace    medinet-auto-cls-m3-m4-smart-batch
-// @version      2.3.24
+// @version      2.3.30
 // @description  Tự nhận diện M3/M4: điền/lưu/đối chiếu CLS, sửa lưu âm tính nước tiểu; chưa có XN ghi mục Khác; lưu Kết luận và nhật ký Excel.
 // @match        https://quanlyskcd.medinet.org.vn/*
 // @grant        none
@@ -25,7 +25,7 @@
     // - Lỗi kỹ thuật => thử nhanh, gác tạm theo cooldown, rồi tự quay lại; không tự dừng batch.
     // - Không tự đoán kết quả xét nghiệm.
 
-    const SCRIPT_VERSION = '2.3.24';
+    const SCRIPT_VERSION = '2.3.30';
     const LOG = '[AUTO CLS SMART BATCH]';
 
     // =====================================================================
@@ -3572,6 +3572,45 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         return Number.isFinite(n) ? n : NaN;
     }
 
+    function parseHctLoose(v) {
+        // HCT ở nguồn/cổng có thể xuất hiện dưới nhiều dạng:
+        // 42 | 42% | 0,42 | 0.42 L/L. Chỉ lấy token số đầu tiên và
+        // chuẩn hoá về L/L để so sánh, không thay đổi giá trị đang ghi lên cổng.
+        const raw = String(v ?? '').trim();
+        if (!raw) return NaN;
+        const m = raw.replace(/\s/g, '').match(/[-+]?\d+(?:[.,]\d+)?/);
+        if (!m) return NaN;
+        let n = Number(m[0].replace(',', '.'));
+        if (!Number.isFinite(n)) return NaN;
+        // HCT hợp lệ theo dạng phần trăm thường > 1; quy về L/L.
+        if (Math.abs(n) > 1.5) n = n / 100;
+        return n;
+    }
+
+    function clsNumericEquivalent(column, expectedRaw, candidateRaw) {
+        const close = (a, b, tol = 0.000001) => Math.abs(a - b) <= tol;
+
+        if (column === 'HCT') {
+            const expectedHct = parseHctLoose(expectedRaw);
+            const candidateHct = parseHctLoose(candidateRaw);
+            if (!Number.isFinite(expectedHct) || !Number.isFinite(candidateHct)) return false;
+
+            // Medinet hiện HCT chỉ với 2 chữ số thập phân (L/L) và ở một số
+            // hồ sơ giá trị 0,427 được hiển thị/lưu thành 0,42. Vì vậy không
+            // được so tuyệt đối theo giá trị nguồn 3 chữ số. Nếu chênh lệch
+            // nằm trong đúng một đơn vị hiển thị 0,01 L/L thì xem là cùng
+            // giá trị ở độ chính xác mà form Medinet thực sự lưu/hiển thị.
+            // Điều này vẫn đủ chặt để không chấp nhận sai lệch lớn (vd 0,42
+            // so với 0,44).
+            return close(expectedHct, candidateHct, 0.009999);
+        }
+
+        const expected = parseNumberLoose(expectedRaw);
+        const candidate = parseNumberLoose(candidateRaw);
+        if (!Number.isFinite(expected) || !Number.isFinite(candidate)) return false;
+        return close(expected, candidate);
+    }
+
     async function dispatchInputValue(input, value) {
         input.focus();
         nativeInputSetter.call(input, value);
@@ -3857,17 +3896,17 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
 
         CLS_WRITES.pending++;
         try {
-            // v2.3.24: không ghi chuỗi "Negative" vào hnumberbox nữa. Một số hồ sơ
-            // hiển thị Negative trước khi Lưu nhưng payload backend lại bỏ giá trị này,
-            // nên khi mở lại các ô LEU/BLD/PRO/GLU/KET/BIL/URO trở thành trống.
-            // Portal chấp nhận 0 là kết quả âm tính (placeholder: "Negative hoặc nhập số").
-            // Ghi 0 vào state DevExtreme + Angular/model + input/hidden để payload Lưu có
-            // giá trị thực, không chỉ có chữ hiển thị trên màn hình.
+            // v2.3.26: các chỉ số nước tiểu định tính âm tính phải hiển thị
+            // đúng chữ "Negative" như giao diện Medinet. Vẫn commit vào cả
+            // DevExtreme + Angular model + input/hidden để tránh trường hợp chỉ
+            // hiện trên màn hình nhưng backend không nhận giá trị khi Lưu.
+            const value = 'Negative';
             const editor = getDevExtremeEditor(input);
             let committed = false;
+
             if (editor?.instance?.option) {
                 try {
-                    editor.instance.option('value', 0);
+                    editor.instance.option('value', value);
                     committed = true;
                 } catch (_) {}
             }
@@ -3875,31 +3914,34 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             const component = getAngularControlComponent(input);
             if (component) {
                 for (const prop of ['value', 'model', 'ngModel', 'inputValue']) {
-                    try { if (prop in component) component[prop] = 0; } catch (_) {}
+                    try { if (prop in component) component[prop] = value; } catch (_) {}
                 }
                 for (const method of ['writeValue', 'onChange', '_onChange', 'propagateChange']) {
-                    try { if (typeof component[method] === 'function') component[method](0); } catch (_) {}
+                    try { if (typeof component[method] === 'function') component[method](value); } catch (_) {}
                 }
                 for (const emitter of ['valueChange', 'modelChange', 'ngModelChange', 'change']) {
-                    try { if (typeof component[emitter]?.emit === 'function') component[emitter].emit(0); } catch (_) {}
+                    try { if (typeof component[emitter]?.emit === 'function') component[emitter].emit(value); } catch (_) {}
                 }
                 try { component.changeDetectorRef?.detectChanges?.(); } catch (_) {}
                 try { component.cdr?.detectChanges?.(); } catch (_) {}
             }
 
-            input.focus();
-            try { input.select(); } catch (_) {}
-            nativeInputSetter.call(input, '0');
-            input.dispatchEvent(new InputEvent('input', {
-                bubbles: true, inputType: 'insertText', data: '0'
-            }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            input.blur();
-            input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            // Phát event giống thao tác gõ thật để control tùy biến của Medinet
+            // cập nhật đầy đủ touched/change state trước khi lưu.
+            const typed = await typeNegativeLikeUser(input);
+            if (!typed) {
+                nativeInputSetter.call(input, value);
+                input.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, inputType: 'insertText', data: value
+                }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.blur();
+                input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            }
 
             const host = input.closest?.('hnumberbox,.dx-numberbox,dx-number-box');
             for (const hidden of host?.querySelectorAll?.('input[type="hidden"]') || []) {
-                hidden.value = '0';
+                hidden.value = value;
                 hidden.dispatchEvent(new Event('input', { bubbles: true }));
                 hidden.dispatchEvent(new Event('change', { bubbles: true }));
             }
@@ -3907,12 +3949,11 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
             await sleep(180);
             const widgetValue = editor?.instance?.option ? editor.instance.option('value') : input.value;
             const ok = isNegativeDisplayedValue(input.value || '') ||
-                (Number.isFinite(Number(widgetValue)) && Number(widgetValue) === 0);
+                isNegativeDisplayedValue(widgetValue || '');
             if (!ok && !committed) {
-                // Fallback cuối: dùng helper chung để phát đủ event nếu control portal khác loại.
-                await dispatchInputValue(input, '0');
+                await dispatchInputValue(input, value);
             }
-            return isNegativeDisplayedValue(input.value || '') ? input.value : '0';
+            return 'Negative';
         } finally {
             CLS_WRITES.pending = Math.max(0, CLS_WRITES.pending - 1);
             CLS_WRITES.completed++;
@@ -4179,31 +4220,38 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
                 const widgetValue = editor?.instance?.option
                     ? editor.instance.option('value')
                     : displayed;
-                const widgetHasValue = widgetValue !== null && widgetValue !== undefined && String(widgetValue).trim() !== '';
                 const requiresNegativeText =
                     QUALITATIVE_URINE_COLUMNS.includes(f.column) &&
                     isNegativeUrineValue(raw);
                 let valueMatches = true;
                 if (requiresNegativeText) {
                     valueMatches = isNegativeDisplayedValue(displayed) ||
+                        isNegativeDisplayedValue(String(widgetValue ?? '')) ||
                         (Number.isFinite(Number(widgetValue)) && Number(widgetValue) === 0);
                 } else {
                     const expectedNum = parseNumberLoose(raw);
-                    const shownNum = parseNumberLoose(displayed);
-                    const widgetNum = parseNumberLoose(widgetValue);
                     if (Number.isFinite(expectedNum)) {
                         valueMatches =
-                            (Number.isFinite(shownNum) && Math.abs(shownNum - expectedNum) < 0.000001) ||
-                            (Number.isFinite(widgetNum) && Math.abs(widgetNum - expectedNum) < 0.000001);
+                            clsNumericEquivalent(f.column, raw, displayed) ||
+                            clsNumericEquivalent(f.column, raw, widgetValue);
                     } else {
                         valueMatches = norm(displayed) === norm(raw) || norm(String(widgetValue ?? '')) === norm(raw);
                     }
                 }
+                // Không bắt buộc state DevExtreme và chữ trên input phải đồng thời
+                // có giá trị. Một số NumberBox của Medinet cập nhật hai lớp lệch
+                // nhau vài nhịp; chỉ cần một lớp phản ánh đúng dữ liệu nguồn.
                 if (
                     !input || !input.isConnected || !isVisibleElement(input) ||
-                    !displayed || !widgetHasValue || !valueMatches
+                    !displayed || !valueMatches
                 ) {
-                    unstable.push(f.label);
+                    // HCT từng gây treo dù ô đã hiện 0,42 do nguồn có thể là 42%,
+                    // nên khi còn mismatch phải hiện luôn hai phía để chẩn đoán.
+                    if (f.column === 'HCT') {
+                        unstable.push(`${f.label} [nguồn=${String(raw)} · ô=${displayed || 'trống'} · widget=${String(widgetValue ?? '')}]`);
+                    } else {
+                        unstable.push(f.label);
+                    }
                 } else {
                     signatureParts.push(`${f.column}:${getClsControlId(input)}:${displayed}:${String(widgetValue)}`);
                 }
@@ -5105,6 +5153,97 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         queueRun();
     }
 
+    function isConclusionOtherSelected(item) {
+        if (!item) return false;
+        if (item.getAttribute('aria-selected') === 'true') return true;
+        if (item.classList.contains('dx-list-item-selected')) return true;
+        const radio = item.querySelector('[role="radio"], .dx-radiobutton');
+        return !!radio && (
+            radio.getAttribute('aria-checked') === 'true' ||
+            radio.classList.contains('dx-radiobutton-checked')
+        );
+    }
+
+    function findConclusionOtherOption() {
+        const options = [...document.querySelectorAll('.dx-list-item[role="option"], [role="option"]')]
+            .filter(isVisibleElement)
+            .filter(el => norm((el.querySelector('.dx-item-content') || el).textContent || '') === 'khac');
+        if (!options.length) return null;
+
+        // Ưu tiên đúng nhóm "3. Đề nghị". Tránh nhầm các mục "Khác" khác nếu
+        // Medinet bổ sung thêm control trên cùng trang.
+        const scored = options.map(el => {
+            let score = 0;
+            let p = el;
+            for (let i = 0; p && i < 7; i++, p = p.parentElement) {
+                const t = norm(p.textContent || '');
+                if (t.includes('de nghi')) score += 10;
+                if (t.includes('binh thuong') && t.includes('chuyen tuyen')) score += 6;
+                if (t.includes('co yeu to nguy co')) score += 4;
+            }
+            return { el, score };
+        }).sort((a, b) => b.score - a.score);
+        return scored[0]?.el || null;
+    }
+
+    async function confirmConclusionOtherSelectedStable(label = 'xác nhận') {
+        // Không chỉ kiểm một snapshot. DevExtreme có thể đổi DOM ngay sau click;
+        // yêu cầu trạng thái "Khác" tồn tại ổn định qua nhiều nhịp render.
+        const deadline = Date.now() + 1800;
+        let stableSince = 0;
+        while (Date.now() < deadline) {
+            const fresh = findConclusionOtherOption();
+            const selected = !!fresh && isConclusionOtherSelected(fresh);
+            if (selected) {
+                if (!stableSince) stableSince = Date.now();
+                if (Date.now() - stableSince >= 450) return fresh;
+            } else {
+                stableSince = 0;
+            }
+            await sleep(90);
+        }
+        warn(`Kết luận · ${label}: "Khác" chưa ổn định.`);
+        return null;
+    }
+
+    async function ensureConclusionOtherSelected() {
+        let item = await waitFor(() => findConclusionOtherOption(), 12000, 150);
+        if (!item) throw new Error('Không tìm thấy lựa chọn “Khác” trong mục Đề nghị của Kết luận.');
+
+        // XÁC NHẬN LẦN 1: nếu đã chọn sẵn thì vẫn phải thấy trạng thái ổn định,
+        // không dùng một lần đọc aria-checked/aria-selected duy nhất.
+        let stable = await confirmConclusionOtherSelectedStable('xác nhận lần 1');
+        if (!stable) {
+            showStatus('Kết luận · đang chọn Đề nghị = Khác trước khi lưu...');
+            const target = item.querySelector('[role="radio"], .dx-list-select-radiobutton, .dx-radiobutton') || item;
+            robustClick(target);
+            stable = await confirmConclusionOtherSelectedStable('sau click radio');
+        }
+
+        if (!stable) {
+            // DevExtreme đôi khi chỉ nhận click trên toàn item, không nhận ở radio con.
+            item = findConclusionOtherOption() || item;
+            robustClick(item);
+            stable = await confirmConclusionOtherSelectedStable('sau click cả dòng');
+        }
+        if (!stable) throw new Error('Không chọn được “Khác” trong mục Đề nghị; chưa lưu Kết luận.');
+
+        // XÁC NHẬN LẦN 2: chờ thêm một nhịp Angular/DevExtreme rồi đọc lại
+        // từ DOM mới. Nếu trạng thái bị rơi, thử chọn lại đúng 1 lần.
+        await sleep(350);
+        let finalCheck = await confirmConclusionOtherSelectedStable('xác nhận lần 2 trước khi lưu');
+        if (!finalCheck) {
+            const fresh = findConclusionOtherOption();
+            if (fresh) {
+                const target = fresh.querySelector('[role="radio"], .dx-list-select-radiobutton, .dx-radiobutton') || fresh;
+                robustClick(target);
+                finalCheck = await confirmConclusionOtherSelectedStable('xác nhận lại cuối cùng');
+            }
+        }
+        if (!finalCheck) throw new Error('Đề nghị “Khác” không giữ trạng thái sau khi chọn; chưa lưu Kết luận.');
+        return true;
+    }
+
     async function handleSaveConclusion() {
         if (!isConclusionPage()) {
             setStage(STAGE.OPEN_CONCLUSION);
@@ -5118,6 +5257,15 @@ Ca hoàn tất bằng bản cũ cần rà lại Negative: ${previousDone.length}
         }
         const c = getCase();
         if (!c) throw new Error('Mất thông tin ca trước khi lưu Kết luận.');
+
+        // BẮT BUỘC chọn Đề nghị = Khác trước khi lưu Kết luận. Nếu control chưa
+        // render hoặc click không được thì giữ ca lại, tuyệt đối không bấm Lưu.
+        await ensureConclusionOtherSelected();
+        // Chốt thêm đúng tại thời điểm ngay trước Lưu để không có cửa sổ race
+        // giữa bước xác nhận và cú bấm Lưu thay đổi.
+        const otherJustBeforeSave = await confirmConclusionOtherSelectedStable('chốt ngay trước Lưu');
+        if (!otherJustBeforeSave) throw new Error('Đề nghị “Khác” mất trạng thái ngay trước khi lưu Kết luận; chưa bấm Lưu.');
+        await sleep(120);
 
         // Ghi stage TRƯỚC cú bấm giống Lưu CLS. Nếu Medinet full reload ngay
         // sau khi lưu, userscript sẽ tiếp tục ở RETURN_LIST thay vì bấm Lưu lại.
